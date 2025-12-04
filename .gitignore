@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Docker
+.dockerignore
+
+# Logs and data
+*.log
+logs/
+*.pkl
+*.ckpt
+*.pt
+*.pth
+
+# Temporary files
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Large files (IsaacGym and datasets)
+isaacgym/
+datasets/

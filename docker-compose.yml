@@ -1,0 +1,37 @@
+services:
+  twist2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: twist2_ig
+    container_name: twist2
+
+    runtime: nvidia
+    environment:
+      - DISPLAY=${DISPLAY}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+
+    network_mode: host
+    ipc: host
+
+    volumes:
+      # X11 access
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
+      # Project mounts
+      - ./isaacgym:/opt/isaacgym
+      - ./twist2:/workspace/twist2
+
+      # Vulkan ICD + Implicit layers (read-only OK)
+      - /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro
+      - /usr/share/vulkan/implicit_layer.d:/usr/share/vulkan/implicit_layer.d:ro
+
+      # ❌ REMOVE THIS (it broke the container)
+      # - /usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:ro
+
+    tty: true
+    stdin_open: true
+
+    command: /bin/bash
+

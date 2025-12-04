@@ -1,0 +1,35 @@
+# TWIST2 Docker Requirements
+# Core dependencies for TWIST2 humanoid robot control and training
+
+# Redis for motion streaming
+redis>=6.0.0
+
+# ONNX Runtime for inference
+onnxruntime-gpu>=1.19.0
+
+# MuJoCo physics engine
+mujoco>=3.0.0
+
+# Visualization and logging
+rich
+wandb
+termcolor
+coloredlogs
+
+# Geometry processing
+pydelatin
+pyfqmr
+
+# Utilities
+tqdm
+numpy==1.23.5
+
+# Computer Vision
+opencv-python>=4.5.0
+
+# Note: The following are installed separately:
+# - isaacgym (from /opt/isaacgym/python)
+# - legged_gym (from twist2/legged_gym)
+# - rsl_rl (from twist2/rsl_rl)
+# - pose (from twist2/pose)
+
