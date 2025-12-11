@@ -37,3 +37,6 @@ Thumbs.db
 # Large files (IsaacGym and datasets)
 isaacgym/
 datasets/
+
+# Installers
+Miniconda*.sh

@@ -63,3 +63,6 @@ echo "You can now test fresh installation:"
 echo "  ./scripts/install.sh"
 echo ""
 
+
+
+

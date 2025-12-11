@@ -13,6 +13,41 @@ echo "TWIST2 Docker Installation"
 echo "========================================"
 echo ""
 
+cd "$PROJECT_ROOT"
+
+# Initialize git submodules (unitree_sdk2 and GMR)
+echo "Step 1: Initializing git submodules..."
+if git submodule update --init --recursive; then
+    echo "✅ Submodules initialized (unitree_sdk2, GMR)"
+else
+    echo "⚠️  Warning: Could not initialize submodules (may need to run manually)"
+fi
+echo ""
+
+# Check if IsaacGym is present
+echo "Step 2: Checking IsaacGym..."
+if [ -d "isaacgym" ] && [ -d "isaacgym/python" ]; then
+    echo "✅ IsaacGym directory found"
+else
+    echo "❌ IsaacGym directory not found!"
+    echo ""
+    echo "IsaacGym must be downloaded separately from NVIDIA:"
+    echo "  1. Go to: https://developer.nvidia.com/isaac-gym"
+    echo "  2. Register and download Isaac Gym Preview 4"
+    echo "  3. Extract to: $PROJECT_ROOT/isaacgym"
+    echo ""
+    echo "Expected structure:"
+    echo "  $PROJECT_ROOT/isaacgym/python/"
+    echo "  $PROJECT_ROOT/isaacgym/docs/"
+    echo ""
+    read -p "Continue without IsaacGym? (Docker will fail to build) (y/N) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+echo ""
+
 # Check if Docker is installed
 if ! command -v docker &> /dev/null; then
     echo "❌ Docker is not installed!"

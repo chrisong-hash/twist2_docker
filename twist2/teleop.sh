@@ -1,6 +1,12 @@
 # sudo ufw disable
 
-source ~/miniconda3/bin/activate gmr
+# Activate gmr environment (adjust path for Docker vs local)
+if [ -f "/opt/miniconda3/etc/profile.d/conda.sh" ]; then
+    source /opt/miniconda3/etc/profile.d/conda.sh
+    conda activate gmr
+else
+    source ~/miniconda3/bin/activate gmr
+fi
 
 cd deploy_real
 

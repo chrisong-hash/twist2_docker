@@ -1,104 +1,85 @@
 # TWIST2 Docker Environment
 
-A ready-to-use Docker environment for TWIST2 humanoid robot control, training, and deployment.
+A Docker environment for TWIST2 humanoid robot control and teleoperation with Unitree G1.
 
-## ⚡ Super Quick Start
+## Quick Start
 
 ```bash
-git clone <your-repo>
+# Clone with submodules
+git clone --recursive <your-repo>
 cd twist2_docker
-chmod +x scripts/*.sh
-./scripts/install.sh    # First time setup
-./scripts/run.sh        # Start container
+
+# Download IsaacGym (requires NVIDIA registration)
+# https://developer.nvidia.com/isaac-gym
+# Extract to: twist2_docker/isaacgym/
+
+# Build and run
+docker compose build
+docker compose up -d
 docker exec -it twist2 bash
 ```
 
----
+## Prerequisites
 
-## 🚀 Detailed Setup
-
-### Prerequisites
 - Docker with NVIDIA GPU support
 - NVIDIA drivers installed on host
-- X11 display for GUI (Isaac Gym visualization)
+- X11 display for GUI
+- For real robot: Unitree G1 hardware
 
-### Option A: Using Helper Scripts (Recommended)
+## Setup
 
-```bash
-# 1. Clone the repository
-git clone <your-repo>
-cd twist2_docker
-
-# 2. Make scripts executable
-chmod +x scripts/*.sh
-
-# 3. Run installation (checks dependencies, builds image)
-./scripts/install.sh
-
-# 4. Start the container
-./scripts/run.sh
-
-# 5. Enter and verify
-docker exec -it twist2 bash
-cd /workspace/twist2
-bash verify_docker_setup.sh
-```
-
-See [scripts/README.md](scripts/README.md) for more details on the helper scripts.
-
-### Option B: Manual Setup
+### 1. Allow X11 Access
 
 ```bash
-# 1. Clone and setup
-git clone <your-repo>
-cd twist2_docker
-
-# 2. Allow Docker to access X11 display
 xhost +local:docker
+```
 
-# Optional: To make it persistent (run once):
-echo 'xhost +local:docker >/dev/null 2>&1' >> ~/.bashrc
+### 2. Build Container
 
-# 3. Build the Docker image (first time only, ~10-15 minutes)
+```bash
 docker compose build
+```
 
-# 4. Start the container
+### 3. Start Container
+
+```bash
 docker compose up -d
+```
 
-# 5. Enter the container
+### 4. Enter Container
+
+```bash
 docker exec -it twist2 bash
 ```
 
-### 3. Verify Installation
+## Usage
 
+### Teleoperation with Real Robot
+
+**Requirements:**
+- PICO VR controller with XRobotStreamer
+- Unitree G1 robot connected via Ethernet
+- Network configured: IP `192.168.123.222`, netmask `255.255.255.0`
+- Robot in dev mode (L2+R2 on remote)
+
+**Terminal 1 - Low-level controller:**
 ```bash
-# Inside the container
+docker exec -it twist2 bash
 cd /workspace/twist2
-bash verify_docker_setup.sh
+bash sim2real.sh
 ```
 
-All checks should pass ✅
+**Terminal 2 - Teleoperation:**
+```bash
+docker exec -it twist2 bash
+cd /workspace/twist2
+bash teleop.sh
 
-## 📋 What's Included
+# Or with Inspire hands (trigger-based control):
+bash teleop_inspire.sh
+```
 
-### Pre-installed Software
-- ✅ Isaac Gym (physics simulation)
-- ✅ PyTorch with CUDA support
-- ✅ Redis (for motion streaming)
-- ✅ ONNXRuntime GPU (for inference)
-- ✅ MuJoCo (physics engine)
-- ✅ All TWIST2 dependencies
-- ✅ Pretrained checkpoint (`assets/ckpts/twist2_1017_20k.onnx`)
-- ✅ Example motion files
-
-### TWIST2 Modules
-- `legged_gym` - Training environments
-- `rsl_rl` - Reinforcement learning
-- `pose` - Pose estimation and retargeting
-
-## 🧪 Testing the Setup
-
-### Test 1: Simulation (Sim2Sim)
+### Simulation Testing (Sim2Sim)
 
 **Terminal 1 - Low-level controller:**
 ```bash
@@ -107,8 +88,6 @@ cd /workspace/twist2
 bash sim2sim.sh
 ```
 
-Expected: Isaac Gym window opens with G1 robot standing
-
 **Terminal 2 - Motion server:**
 ```bash
 docker exec -it twist2 bash
@@ -116,89 +95,60 @@ cd /workspace/twist2
 bash run_motion_server.sh
 ```
 
-Expected: Robot in Isaac Gym follows the walking motion
-
-### Test 2: Training
+### Training
 
 ```bash
 docker exec -it twist2 bash
 cd /workspace/twist2
 
-# Quick test (100 iterations)
+# Quick test
 bash train.sh test_docker cuda:0
-# Press Ctrl+C after confirming it works
 
 # Full training (requires dataset)
-# Download dataset and update path in legged_gym/motion_data_configs/twist2_dataset.yaml
 bash train.sh my_experiment cuda:0
 ```
 
-### Test 3: GUI Interface
+## Configuration
 
-```bash
-docker exec -it twist2 bash
-cd /workspace/twist2
-bash gui.sh
+### Increasing Robot Gains
+
+To increase power for walking or other movements, edit `twist2/deploy_real/robot_control/configs/g1.yaml`:
+
+```yaml
+kps: [150, 150, 150, 200, 60, 60,  # left leg (increase for more power)
+      150, 150, 150, 200, 60, 60,  # right leg
+      # ... other joints
+     ]
+
+action_scale: 0.75  # increase for more aggressive movements
 ```
 
-Control everything from a single interface!
-
-### Test 4: Real Robot Deployment
-
-⚠️ **Only if you have Unitree G1 hardware**
-
-1. Connect robot via Ethernet
-2. Configure network: IP `192.168.123.222`, netmask `255.255.255.0`
-3. Put robot in dev mode (L2+R2 on remote)
-4. Update network interface in `sim2real.sh`
-5. Run: `bash sim2real.sh`
-
-See [VERIFICATION_GUIDE.md](twist2/VERIFICATION_GUIDE.md) for detailed instructions.
-
-## 📁 Directory Structure
+## Directory Structure
 
 ```
 twist2_docker/
-├── README.md                # This file
-├── requirements.txt         # Python dependencies
-├── docker-compose.yml       # Docker compose configuration
-├── Dockerfile               # Docker image definition
-├── scripts/                 # Helper scripts
-│   ├── install.sh           # First-time setup
-│   ├── run.sh               # Start container
-│   ├── rebuild_docker.sh    # Rebuild from scratch
-│   └── README.md            # Scripts documentation
-├── isaacgym/               # Isaac Gym installation
-└── twist2/                 # TWIST2 source code (mounted)
+├── README.md
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── isaacgym/              # Isaac Gym installation
+├── GMR/                   # General Motion Retargeting
+├── unitree_sdk2/          # Unitree SDK
+└── twist2/                # TWIST2 source code
     ├── assets/
-    │   ├── ckpts/          # Pretrained checkpoints
-    │   └── example_motions/ # Sample motion files
-    ├── legged_gym/         # Training environments
-    ├── rsl_rl/             # RL algorithms
-    ├── pose/               # Pose estimation
-    ├── deploy_real/        # Deployment scripts
-    ├── sim2sim.sh          # Simulation test
-    ├── train.sh            # Training script
-    ├── gui.sh              # GUI interface
-    └── verify_docker_setup.sh  # Setup verification
+    │   └── ckpts/         # Pretrained checkpoints
+    ├── deploy_real/       # Real robot deployment
+    │   ├── robot_control/ # Robot control modules
+    │   └── xrobot_teleop_to_robot_w_hand.py
+    ├── legged_gym/        # Training environments
+    ├── rsl_rl/            # RL algorithms
+    ├── teleop.sh          # Teleoperation script
+    ├── sim2real.sh        # Real robot low-level controller
+    ├── sim2sim.sh         # Simulation test
+    └── train.sh           # Training script
 ```
 
-## 🔧 Common Commands
-
-### Using Helper Scripts (Recommended)
-
-```bash
-# First time setup
-./scripts/install.sh
-
-# Start/resume work
-./scripts/run.sh
-
-# Rebuild everything
-./scripts/rebuild_docker.sh
-```
-
-### Container Management (Manual)
+## Common Commands
 
 ```bash
 # Start container
@@ -207,103 +157,54 @@ docker compose up -d
 # Stop container
 docker compose down
 
-# Rebuild after Dockerfile changes
+# Rebuild after changes
 docker compose build --no-cache
 docker compose up -d --force-recreate
 
-# View container logs
+# View logs
 docker logs twist2
 
-# Multiple terminals
-docker exec -it twist2 bash  # Terminal 1
-docker exec -it twist2 bash  # Terminal 2 (new host terminal)
-docker exec -it twist2 bash  # Terminal 3 (new host terminal)
-```
-
-### Inside Container
-
-```bash
-# Check Redis status
-redis-cli ping  # Should return: PONG
+# Check Redis
+docker exec twist2 redis-cli ping
 
 # Check GPU
-nvidia-smi
-
-# Check Python packages
-pip list | grep -E "torch|isaac|redis|onnx|mujoco"
-
-# Run verification
-bash verify_docker_setup.sh
+docker exec twist2 nvidia-smi
 ```
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
-### Issue: "Cannot open display"
-**Solution:** On host, run `xhost +local:docker`
-
-### Issue: "CUDA not available"
-**Solution:** 
-- Check: `docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu20.04 nvidia-smi`
-- Ensure nvidia-docker2 is installed
-- Restart Docker daemon
-
-### Issue: "Redis connection refused"
-**Solution:** Redis should auto-start, but you can manually start:
+### Cannot open display
 ```bash
-redis-server --daemonize yes
+xhost +local:docker
 ```
 
-### Issue: Container won't start
-**Solution:**
+### CUDA not available
 ```bash
-docker logs twist2  # Check logs
-docker compose down
-docker compose up -d
+# Test NVIDIA Docker
+docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu20.04 nvidia-smi
 ```
 
-### Issue: Low FPS in simulation
-**Solution:**
-- Close other GPU applications
-- Reduce `num_envs` for training
-- Check GPU utilization: `nvidia-smi`
+### Redis connection refused
+```bash
+docker exec twist2 redis-server --daemonize yes
+```
 
-## 📚 Additional Documentation
+### Robot not moving
+- Check gains in `g1.yaml`
+- Verify network connection to robot
+- Ensure robot is in dev mode
+- Check Redis connection
 
-- [DOCKER_VERIFICATION_STEPS.md](DOCKER_VERIFICATION_STEPS.md) - Detailed verification guide
-- [twist2/VERIFICATION_GUIDE.md](twist2/VERIFICATION_GUIDE.md) - Complete capability testing
-- [TWIST2 Paper](https://yanjieze.com/TWIST2) - Research paper and project page
-
-## 🎯 Verified Capabilities
-
-This Docker environment has been tested and verified for:
-
-| Capability | Status | Command |
-|------------|--------|---------|
-| **Simulation** | ✅ | `bash sim2sim.sh` |
-| **Training** | ✅ | `bash train.sh <exp> cuda:0` |
-| **Evaluation** | ✅ | `bash eval.sh <exp> cuda:0` |
-| **Real Robot** | ⚠️ | `bash sim2real.sh` (requires hardware) |
-
-## 🤝 Contributing
-
-If you use this Docker setup:
-1. Report issues via GitHub Issues
-2. Share improvements via Pull Requests
-3. Star the repo if it helped you! ⭐
-
-## 📄 License
+## License
 
 MIT License - See LICENSE file for details
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - TWIST2 repository: [amazon-far/TWIST2](https://github.com/amazon-far/TWIST2)
 - Isaac Gym by NVIDIA
-- AMASS and OMOMO datasets (research use only)
+- Unitree Robotics
 
 ---
 
-**Ready to build humanoid robots?** 🤖🚀
-
-For questions: yanjieze@stanford.edu (original TWIST2 author)
-
+**Questions?** yanjieze@stanford.edu (original TWIST2 author)

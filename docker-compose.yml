@@ -22,6 +22,8 @@ services:
       # Project mounts
       - ./isaacgym:/opt/isaacgym
       - ./twist2:/workspace/twist2
+      - ./unitree_sdk2:/workspace/unitree_sdk2
+      - ./GMR:/workspace/GMR
 
       # Vulkan ICD + Implicit layers (read-only OK)
       - /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro
@@ -33,5 +35,6 @@ services:
     tty: true
     stdin_open: true
 
-    command: /bin/bash
+    entrypoint: /bin/bash
+    command: -c "redis-server --daemonize yes && source /opt/miniconda3/etc/profile.d/conda.sh && conda activate twist2 && tail -f /dev/null"
 
