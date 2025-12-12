@@ -84,16 +84,16 @@ echo ""
 echo "Setting up X11 access for Docker..."
 xhost +local:docker >/dev/null 2>&1
 
-# Ask if user wants to make it persistent
-read -p "Make X11 access persistent (add to ~/.bashrc)? (Y/n) " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-    if ! grep -q "xhost +local:docker" ~/.bashrc; then
+# Make it persistent if not already in bashrc
+if grep -q "xhost +local:docker" ~/.bashrc; then
+    echo "✅ X11 access already configured in ~/.bashrc"
+else
+    read -p "Make X11 access persistent (add to ~/.bashrc)? (Y/n) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
         echo "# Allow Docker to access X11 display" >> ~/.bashrc
         echo "xhost +local:docker >/dev/null 2>&1" >> ~/.bashrc
         echo "✅ Added to ~/.bashrc"
-    else
-        echo "✅ Already in ~/.bashrc"
     fi
 fi
 echo ""

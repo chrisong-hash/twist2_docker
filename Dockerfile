@@ -70,7 +70,6 @@ WORKDIR /workspace
 COPY twist2 ./twist2
 COPY unitree_sdk2 ./unitree_sdk2
 COPY GMR ./GMR
-COPY test_all_installations.py ./test_all_installations.py
 
 # Install main dependencies from requirements.txt
 COPY requirements.txt /workspace/
