@@ -39,3 +39,8 @@ python xrobot_teleop_inspire.py \
 
 echo "Teleoperation with Inspire hands stopped."
 
+
+
+
+
+
