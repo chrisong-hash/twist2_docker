@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     vim \
     nano \
+    unzip \
     python3-dev \
     python3-pip \
     python3-venv \
@@ -30,6 +31,10 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
     pybind11-dev \
+    libportaudio2 \
+    portaudio19-dev \
+    pulseaudio-utils \
+    libpulse0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
@@ -213,6 +218,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     else \
         echo "⚠️  GMR not present - skipping XRoboToolkit"; \
     fi
+
+# Install voice recognition packages (vosk + sounddevice) in gmr env
+WORKDIR /workspace
+RUN source /opt/miniconda3/etc/profile.d/conda.sh && \
+    conda activate gmr && \
+    pip install vosk sounddevice
+
+# Download vosk speech recognition model
+RUN wget -q https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip && \
+    unzip vosk-model-small-en-us-0.15.zip && \
+    rm vosk-model-small-en-us-0.15.zip
 
 # Auto-activate twist2 environment in bashrc
 RUN echo 'source /opt/miniconda3/etc/profile.d/conda.sh' >> /root/.bashrc && \
