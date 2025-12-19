@@ -40,3 +40,6 @@ datasets/
 
 # Installers
 Miniconda*.sh
+
+# Pip cache for Docker builds
+pip_cache/

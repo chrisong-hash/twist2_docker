@@ -23,11 +23,18 @@ ContollerMapping ={
     }
 
 class G1RealWorldEnv:
-    def __init__(self, net, config):
+    def __init__(self, net, config, use_arm_sdk=False):
         
         self.config = config
         self.robot = unitree_interface.create_robot(net, unitree_interface.RobotType.G1, unitree_interface.MessageType.HG)
         self.running = True
+        self.use_arm_sdk = use_arm_sdk
+        
+        # Arm SDK mode configuration (for upper body control when using joystick locomotion)
+        if use_arm_sdk:
+            self.robot.enable_arm_sdk(True)
+            self.robot.set_arm_sdk_weight(1.0)  # Full control from arm_sdk
+            print("[green]Arm SDK mode ENABLED - controlling upper body (joints 12-28) via rt/arm_sdk[/green]")
         
         self.torque_limits = np.array([
                 88, 139, 88, 139, 50, 50,
@@ -145,8 +152,49 @@ class G1RealWorldEnv:
         cmd.kp = kps
         cmd.kd = kds
         cmd.tau_ff = np.zeros_like(target_dof_pos)
-        self.send_cmd(cmd)
+        
+        if self.use_arm_sdk:
+            # Use arm_sdk for upper body only (joints 12-28)
+            self.robot.write_arm_sdk_command(cmd)
+        else:
+            # Use standard lowcmd for all joints
+            self.send_cmd(cmd)
         return
+    
+    def send_upper_body_action(self, target_dof_pos, kp_scale=1.0, kd_scale=1.0):
+        """Send commands only to upper body joints (12-28) via arm_sdk.
+        
+        This is used for joystick locomotion mode where:
+        - LocoClient controls legs (0-11)
+        - arm_sdk controls upper body (12-28)
+        
+        Args:
+            target_dof_pos: Full 29-joint position array (only joints 12-28 will be used)
+            kp_scale: Scale factor for position gains
+            kd_scale: Scale factor for velocity gains
+        """
+        if not self.use_arm_sdk:
+            print("[yellow]Warning: send_upper_body_action called but arm_sdk mode is disabled[/yellow]")
+            return
+            
+        cmd = self.robot.create_zero_command()
+        
+        # Only set upper body joints (12-28)
+        cmd.q_target = target_dof_pos.copy()
+        cmd.dq_target = np.zeros_like(target_dof_pos)
+        kps = [self.config.kps[i] * kp_scale for i in range(len(self.config.kps))]
+        kds = [self.config.kds[i] * kd_scale for i in range(len(self.config.kds))]
+        cmd.kp = kps
+        cmd.kd = kds
+        cmd.tau_ff = np.zeros_like(target_dof_pos)
+        
+        # Zero out leg commands (0-11) - arm_sdk will ignore them anyway
+        for i in range(12):
+            cmd.q_target[i] = 0.0
+            cmd.kp[i] = 0.0
+            cmd.kd[i] = 0.0
+        
+        self.robot.write_arm_sdk_command(cmd)
         
 
 

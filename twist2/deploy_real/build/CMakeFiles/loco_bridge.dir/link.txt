@@ -1,0 +1,1 @@
+/usr/bin/c++ -rdynamic CMakeFiles/loco_bridge.dir/g1_loco_redis_bridge.o -o loco_bridge  -lunitree_sdk2 -lhiredis 

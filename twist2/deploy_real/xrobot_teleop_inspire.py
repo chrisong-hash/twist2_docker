@@ -641,6 +641,37 @@ class XRobotTeleopToRobot:
 
         if current_retarget_obs is not None:
             obs_35d = current_retarget_obs[:35] if len(current_retarget_obs) > 35 else current_retarget_obs
+            obs_35d = obs_35d.copy()  # Make a copy to avoid modifying original
+            
+            # Joystick locomotion mode: inject joystick velocity into mimic_obs
+            # mimic_obs structure: [vx, vy, z, roll, pitch, vyaw, joints[0:29]]
+            # joints: [0:6]=left_leg, [6:12]=right_leg, [12:15]=waist, [15:22]=left_arm, [22:29]=right_arm
+            if getattr(self.args, 'joystick_locomotion', False):
+                velocity_commands = self.state_machine.get_velocity_commands()
+                if velocity_commands is not None:
+                    # Scale factors for velocity (tune these as needed)
+                    vx_scale = 1.0   # Forward/backward
+                    vy_scale = 0.5   # Left/right strafe  
+                    vyaw_scale = 1.0 # Turn rate
+                    
+                    # Inject joystick velocity
+                    obs_35d[0] = velocity_commands[0] * vx_scale   # vx from left joystick Y
+                    obs_35d[1] = velocity_commands[1] * vy_scale   # vy from left joystick X
+                    obs_35d[5] = velocity_commands[2] * vyaw_scale # vyaw from right joystick X
+                    
+                    # Option B: Replace leg positions with default standing
+                    # This makes legs respond ONLY to velocity (joystick), not body tracking
+                    # Default leg angles from g1.yaml:
+                    default_left_leg = np.array([-0.2, 0.0, 0.0, 0.4, -0.2, 0.0])
+                    default_right_leg = np.array([-0.2, 0.0, 0.0, 0.4, -0.2, 0.0])
+                    obs_35d[6:12] = default_left_leg   # Left leg joints
+                    obs_35d[12:18] = default_right_leg  # Right leg joints
+                    # Upper body (waist + arms) still tracks from body tracking
+                    
+                    # Debug print velocity injection
+                    if np.any(np.abs(velocity_commands) > 0.01):
+                        print(f"[Joystick] vx={obs_35d[0]:.2f} vy={obs_35d[1]:.2f} vyaw={obs_35d[5]:.2f}")
+            
             self.state_machine.set_current_mimic_obs(obs_35d)
             return obs_35d
 
@@ -912,6 +943,11 @@ def parse_arguments():
         type=str,
         default="192.168.123.211",
         help="IP address for right Inspire hand.",
+    )
+    parser.add_argument(
+        "--joystick_locomotion",
+        action="store_true",
+        help="Enable joystick locomotion: inject Pico joystick velocity into mimic_obs for policy-based walking.",
     )
     return parser.parse_args()
 

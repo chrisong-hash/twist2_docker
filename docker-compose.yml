@@ -24,6 +24,9 @@ services:
       - ./twist2:/workspace/twist2
       - ./unitree_sdk2:/workspace/unitree_sdk2
       - ./GMR:/workspace/GMR
+      
+      # RoboMimic for hybrid locomotion
+      - /home/robo/CodeSpace/RoboMimic_Deploy:/workspace/RoboMimic_Deploy
 
       # Vulkan ICD + Implicit layers (read-only OK)
       - /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro

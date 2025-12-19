@@ -8,6 +8,9 @@ set -e
 SCRIPT_DIR=$(dirname $(realpath $0))
 PROJECT_ROOT=$(dirname $SCRIPT_DIR)
 
+# Enable BuildKit for pip cache mounting (speeds up rebuilds)
+export DOCKER_BUILDKIT=1
+
 echo "========================================"
 echo "TWIST2 Docker Rebuild"
 echo "========================================"
@@ -40,10 +43,11 @@ fi
 
 echo ""
 echo "Step 3: Building new Docker image..."
-echo "This will take ~10-15 minutes..."
+echo "This will take ~10-15 minutes (faster on subsequent builds due to pip caching)..."
 echo ""
 
-if docker compose build --no-cache; then
+# Use BuildKit for cache mounts (pip downloads are cached between builds)
+if DOCKER_BUILDKIT=1 docker compose build; then
     echo ""
     echo "✅ Docker image rebuilt successfully!"
 else

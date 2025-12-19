@@ -101,7 +101,8 @@ class RealTimePolicyController(object):
                  net='eno1',
                  use_hand=False,
                  record_proprio=False,
-                 smooth_body=0.0):
+                 smooth_body=0.0,
+                 use_arm_sdk=False):
         self.redis_client = None
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -111,7 +112,8 @@ class RealTimePolicyController(object):
             exit()
        
         self.config = Config(config_path)
-        self.env = G1RealWorldEnv(net=net, config=self.config)
+        self.use_arm_sdk = use_arm_sdk
+        self.env = G1RealWorldEnv(net=net, config=self.config, use_arm_sdk=use_arm_sdk)
         self.use_hand = use_hand
         if use_hand:
             self.hand_ctrl = Dex3_1_Controller(net, re_init=False)
@@ -338,6 +340,8 @@ def main():
                         help='Record proprioceptive data')
     parser.add_argument('--smooth_body', type=float, default=0.0,
                         help='Smoothing factor for body actions (0.0=no smoothing, 1.0=maximum smoothing)')
+    parser.add_argument('--use_arm_sdk', action='store_true',
+                        help='Enable Arm SDK mode for upper body control. Use this with joystick locomotion.')
     
     args = parser.parse_args()
 
@@ -359,6 +363,7 @@ def main():
     print(f"  Use hand: {args.use_hand}")
     print(f"  Record proprio: {args.record_proprio}")
     print(f"  Smooth body: {args.smooth_body}")
+    print(f"  Use arm_sdk: {args.use_arm_sdk}")
     
     # 安全提示
     print("\n" + "="*50)
@@ -377,6 +382,7 @@ def main():
         use_hand=args.use_hand,
         record_proprio=args.record_proprio,
         smooth_body=args.smooth_body,
+        use_arm_sdk=args.use_arm_sdk,
     )
     
     controller.run()

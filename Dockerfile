@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 FROM nvidia/opengl:1.2-glvnd-runtime-ubuntu20.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -147,7 +148,14 @@ WORKDIR /workspace/GMR
 RUN source /opt/miniconda3/etc/profile.d/conda.sh && \
     conda activate gmr && \
     pip install -e . && \
-    conda install -c conda-forge libstdcxx-ng -y
+    conda install -c conda-forge libstdcxx-ng -y && \
+    pip install pyyaml
+
+# Install PyTorch for LocoMode (separate layer for caching)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    source /opt/miniconda3/etc/profile.d/conda.sh && \
+    conda activate gmr && \
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
 # Install PICO SDK (XRoboToolkit) in gmr env
 WORKDIR /workspace
