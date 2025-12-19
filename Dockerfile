@@ -43,7 +43,8 @@ ENV PATH="/opt/miniconda3/bin:${PATH}"
 SHELL ["/bin/bash", "-c"]
 
 # Configure conda to auto-accept licenses and create environments
-RUN /opt/miniconda3/bin/conda init bash && \
+RUN --mount=type=cache,target=/opt/conda/pkgs \
+    /opt/miniconda3/bin/conda init bash && \
     /opt/miniconda3/bin/conda config --set always_yes yes && \
     /opt/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
     /opt/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r && \
@@ -62,36 +63,44 @@ ENV WANDB_DISABLED=true
 # IsaacGym installation (using twist2 env)
 COPY isaacgym /opt/isaacgym
 WORKDIR /opt/isaacgym/python
-RUN source /opt/miniconda3/etc/profile.d/conda.sh && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    source /opt/miniconda3/etc/profile.d/conda.sh && \
     conda activate twist2 && \
     pip install -e .
 
 # TWIST2 setup and external dependencies
 WORKDIR /workspace
 COPY twist2 ./twist2
+
+# Copy unitree_sdk2 and GMR (they should be in your project)
 COPY unitree_sdk2 ./unitree_sdk2
 COPY GMR ./GMR
 
 # Install main dependencies from requirements.txt
 COPY requirements.txt /workspace/
-RUN source /opt/miniconda3/etc/profile.d/conda.sh && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    source /opt/miniconda3/etc/profile.d/conda.sh && \
     conda activate twist2 && \
     pip install -r requirements.txt
 
 # Install TWIST2 requirements
 WORKDIR /workspace/twist2
-RUN source /opt/miniconda3/etc/profile.d/conda.sh && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    source /opt/miniconda3/etc/profile.d/conda.sh && \
     conda activate twist2 && \
     pip install -r requirements.txt || true
 
 # Install TWIST2 submodules in dependency order
-RUN source /opt/miniconda3/etc/profile.d/conda.sh && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    source /opt/miniconda3/etc/profile.d/conda.sh && \
     conda activate twist2 && \
     cd rsl_rl && pip install -e .
-RUN source /opt/miniconda3/etc/profile.d/conda.sh && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    source /opt/miniconda3/etc/profile.d/conda.sh && \
     conda activate twist2 && \
     cd legged_gym && pip install -e .
-RUN source /opt/miniconda3/etc/profile.d/conda.sh && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    source /opt/miniconda3/etc/profile.d/conda.sh && \
     conda activate twist2 && \
     cd pose && pip install -e .
 
@@ -134,47 +143,76 @@ RUN sed -i 's|twist2_dataset\.yaml|example_motions.yaml|g' legged_gym/legged_gym
     sed -i 's|g1_omomo+mocap_static+amass_walk\.yaml|example_motions.yaml|g' legged_gym/legged_gym/envs/g1/g1_mimic_distill_config.py
 
 # Build Unitree SDK with Python binding (using twist2 env)
+# Note: This may fail if DDS libraries are missing - that's OK for simulation-only use
 WORKDIR /workspace/unitree_sdk2
-RUN source /opt/miniconda3/etc/profile.d/conda.sh && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    source /opt/miniconda3/etc/profile.d/conda.sh && \
     conda activate twist2 && \
-    mkdir -p build && cd build && \
-    cmake .. -DBUILD_PYTHON_BINDING=ON && \
-    make -j$(nproc) && \
-    SITE_PACKAGES=$(/opt/miniconda3/envs/twist2/bin/python -c "import site; print(site.getsitepackages()[0])") && \
-    cp lib/unitree_interface.cpython-*-linux-gnu.so $SITE_PACKAGES/unitree_interface.so
+    if [ -f "CMakeLists.txt" ]; then \
+        mkdir -p build && cd build && \
+        (cmake .. -DBUILD_PYTHON_BINDING=ON -DBUILD_EXAMPLES=OFF && \
+         make -j$(nproc) unitree_interface 2>&1 | tee build.log && \
+         SITE_PACKAGES=$(/opt/miniconda3/envs/twist2/bin/python -c "import site; print(site.getsitepackages()[0])") && \
+         cp lib/unitree_interface*.so $SITE_PACKAGES/unitree_interface.so && \
+         echo "✅ Unitree SDK built successfully") || \
+        echo "⚠️  Unitree SDK build failed - skipping (not needed for simulation)"; \
+    else \
+        echo "⚠️  Unitree SDK not found - skipping"; \
+    fi
 
-# Install GMR (using gmr env)
+# Install GMR (using gmr env) - optional
 WORKDIR /workspace/GMR
-RUN source /opt/miniconda3/etc/profile.d/conda.sh && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/opt/conda/pkgs \
+    source /opt/miniconda3/etc/profile.d/conda.sh && \
     conda activate gmr && \
-    pip install -e . && \
-    conda install -c conda-forge libstdcxx-ng -y && \
-    pip install pyyaml
+    if [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then \
+        (pip install -e . && \
+         conda install -c conda-forge libstdcxx-ng -y && \
+         pip install pyyaml && \
+         echo "✅ GMR installed successfully") || \
+        echo "⚠️  GMR installation failed - skipping"; \
+    else \
+        echo "⚠️  GMR not found - skipping"; \
+    fi
 
-# Install PyTorch for LocoMode (separate layer for caching)
+# Install PyTorch for LocoMode (separate layer for caching) - only if GMR exists
 RUN --mount=type=cache,target=/root/.cache/pip \
     source /opt/miniconda3/etc/profile.d/conda.sh && \
     conda activate gmr && \
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+    if [ -d "/workspace/GMR" ] && [ "$(ls -A /workspace/GMR)" ]; then \
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 && \
+        echo "✅ PyTorch installed for GMR"; \
+    else \
+        echo "⚠️  GMR not present - skipping PyTorch installation"; \
+    fi
 
-# Install PICO SDK (XRoboToolkit) in gmr env
+# Install PICO SDK (XRoboToolkit) in gmr env - optional for real robot deployment
 WORKDIR /workspace
-RUN git clone https://github.com/XR-Robotics/XRoboToolkit-PC-Service-Pybind.git && \
-    cd XRoboToolkit-PC-Service-Pybind && \
-    mkdir -p tmp && cd tmp && \
-    git clone https://github.com/XR-Robotics/XRoboToolkit-PC-Service.git && \
-    cd XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK && \
-    bash build.sh && \
-    cd ../../../.. && \
-    mkdir -p lib include && \
-    cp tmp/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK/PXREARobotSDK.h include/ && \
-    cp -r tmp/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK/nlohmann include/ && \
-    cp tmp/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK/build/libPXREARobotSDK.so lib/ && \
-    rm -rf tmp && \
-    source /opt/miniconda3/etc/profile.d/conda.sh && \
-    conda activate gmr && \
-    conda install -c conda-forge pybind11 -y && \
-    pip install -e .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/opt/conda/pkgs \
+    if [ -d "/workspace/GMR" ] && [ "$(ls -A /workspace/GMR)" ]; then \
+        (git clone https://github.com/XR-Robotics/XRoboToolkit-PC-Service-Pybind.git && \
+         cd XRoboToolkit-PC-Service-Pybind && \
+         mkdir -p tmp && cd tmp && \
+         git clone https://github.com/XR-Robotics/XRoboToolkit-PC-Service.git && \
+         cd XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK && \
+         bash build.sh && \
+         cd ../../../.. && \
+         mkdir -p lib include && \
+         cp tmp/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK/PXREARobotSDK.h include/ && \
+         cp -r tmp/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK/nlohmann include/ && \
+         cp tmp/XRoboToolkit-PC-Service/RoboticsService/PXREARobotSDK/build/libPXREARobotSDK.so lib/ && \
+         rm -rf tmp && \
+         source /opt/miniconda3/etc/profile.d/conda.sh && \
+         conda activate gmr && \
+         conda install -c conda-forge pybind11 -y && \
+         pip install -e . && \
+         echo "✅ XRoboToolkit installed") || \
+        echo "⚠️  XRoboToolkit installation failed - skipping (not needed for simulation)"; \
+    else \
+        echo "⚠️  GMR not present - skipping XRoboToolkit"; \
+    fi
 
 # Auto-activate twist2 environment in bashrc
 RUN echo 'source /opt/miniconda3/etc/profile.d/conda.sh' >> /root/.bashrc && \

@@ -6,7 +6,15 @@ services:
     image: twist2_ig
     container_name: twist2
 
-    runtime: nvidia
+    # GPU configuration (works with both nvidia runtime and nvidia-container-toolkit)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, compute, utility, graphics]
+    
     environment:
       - DISPLAY=${DISPLAY}
       - NVIDIA_VISIBLE_DEVICES=all
@@ -19,21 +27,11 @@ services:
       # X11 access
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
 
-      # Project mounts
-      - ./isaacgym:/opt/isaacgym
+      # Project mounts (essential)
+      - ./isaacgym:/opt/isaacgym:ro
       - ./twist2:/workspace/twist2
       - ./unitree_sdk2:/workspace/unitree_sdk2
       - ./GMR:/workspace/GMR
-      
-      # RoboMimic for hybrid locomotion
-      - /home/robo/CodeSpace/RoboMimic_Deploy:/workspace/RoboMimic_Deploy
-
-      # Vulkan ICD + Implicit layers (read-only OK)
-      - /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro
-      - /usr/share/vulkan/implicit_layer.d:/usr/share/vulkan/implicit_layer.d:ro
-
-      # ❌ REMOVE THIS (it broke the container)
-      # - /usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:ro
 
     tty: true
     stdin_open: true
