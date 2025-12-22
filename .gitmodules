@@ -1,6 +1,6 @@
 [submodule "unitree_sdk2"]
 	path = unitree_sdk2
-	url = https://github.com/YanjieZe/unitree_sdk2.git
+	url = https://github.com/chrisong-hash/unitree_sdk2.git
 [submodule "GMR"]
 	path = GMR
 	url = https://github.com/YanjieZe/GMR.git
