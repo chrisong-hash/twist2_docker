@@ -21,6 +21,149 @@ import sys
 import time
 import subprocess
 
+# RoboMimic path (mounted in Docker container)
+ROBOMIMIC_PATH = "/workspace/RoboMimic_Deploy"
+
+
+def check_setup(verbose=False):
+    """
+    Verify all dependencies and files are available before starting.
+    Returns True if all checks pass, False otherwise.
+    
+    Compact output: single line progress, details only on failure.
+    """
+    errors = []
+    warnings = []
+    checks = []
+    
+    # Helper to update progress
+    def status(msg):
+        if verbose:
+            print(msg)
+        else:
+            sys.stdout.write(f"\r[Setup] {msg}...".ljust(60))
+            sys.stdout.flush()
+    
+    # 1. RoboMimic_Deploy
+    status("Checking RoboMimic_Deploy")
+    if os.path.isdir(ROBOMIMIC_PATH):
+        checks.append("✓")
+    else:
+        checks.append("✗")
+        errors.append(f"RoboMimic_Deploy not found: {ROBOMIMIC_PATH}\n   Fix: Mount in docker-compose.yml")
+    
+    # 2. LocoMode policy
+    status("Checking LocoMode policy")
+    policy_dir = os.path.join(ROBOMIMIC_PATH, "policy", "loco_mode")
+    config_path = os.path.join(policy_dir, "config", "LocoMode.yaml")
+    if os.path.isfile(config_path):
+        try:
+            import yaml
+            with open(config_path, "r") as f:
+                config = yaml.load(f, Loader=yaml.FullLoader)
+            model_path = os.path.join(policy_dir, "model", config.get("policy_path", ""))
+            if os.path.isfile(model_path):
+                checks.append("✓")
+            else:
+                checks.append("✗")
+                errors.append(f"LocoMode model missing: {model_path}")
+        except Exception as e:
+            checks.append("✗")
+            errors.append(f"LocoMode config error: {e}")
+    else:
+        checks.append("✗")
+        errors.append(f"LocoMode config missing: {config_path}")
+    
+    # 3. PyTorch
+    status("Checking PyTorch")
+    try:
+        import torch
+        checks.append("✓")
+        if not torch.cuda.is_available():
+            warnings.append("CUDA not available - CPU only")
+    except ImportError:
+        checks.append("✗")
+        errors.append("PyTorch not installed\n   Fix: pip install torch --index-url https://download.pytorch.org/whl/cu121")
+    
+    # 4. MuJoCo
+    status("Checking MuJoCo")
+    try:
+        import mujoco
+        checks.append("✓")
+    except ImportError:
+        checks.append("✗")
+        errors.append("MuJoCo not installed\n   Fix: pip install mujoco")
+    
+    # 5. GMR
+    status("Checking GMR")
+    try:
+        from general_motion_retargeting import GeneralMotionRetargeting, XRobotStreamer, ROBOT_XML_DICT
+        if "unitree_g1" in ROBOT_XML_DICT and os.path.isfile(ROBOT_XML_DICT["unitree_g1"]):
+            checks.append("✓")
+        else:
+            checks.append("✗")
+            errors.append("G1 robot XML not found in GMR")
+    except ImportError as e:
+        checks.append("✗")
+        errors.append(f"GMR import failed: {e}\n   Fix: pip install -e /workspace/GMR")
+    
+    # 6. Redis
+    status("Checking Redis")
+    try:
+        import redis
+        r = redis.Redis(host='localhost', port=6379)
+        r.ping()
+        checks.append("✓")
+    except ImportError:
+        checks.append("✗")
+        errors.append("redis-py not installed\n   Fix: pip install redis")
+    except:
+        checks.append("⚠")
+        warnings.append("Redis not running (OK for preview mode)")
+    
+    # 7. Other deps
+    status("Checking dependencies")
+    try:
+        import yaml, numpy
+        from loop_rate_limiters import RateLimiter
+        checks.append("✓")
+    except ImportError as e:
+        checks.append("✗")
+        errors.append(f"Missing dependency: {e}")
+    
+    # Clear progress line
+    sys.stdout.write("\r" + " "*60 + "\r")
+    sys.stdout.flush()
+    
+    # Summary - single line for success, details for failures
+    check_str = "".join(checks)
+    if errors:
+        print(f"[Setup] {check_str} FAILED ({len(errors)} errors)\n")
+        for err in errors:
+            print(f"  ✗ {err}")
+        print()
+        return False
+    elif warnings:
+        print(f"[Setup] {check_str} OK ({len(warnings)} warnings)")
+        if verbose:
+            for w in warnings:
+                print(f"  ⚠ {w}")
+        return True
+    else:
+        print(f"[Setup] {check_str} OK")
+        return True
+
+
+# Run setup check before importing heavy modules
+if __name__ == "__main__":
+    # Check for --verbose flag early
+    verbose = "--verbose" in sys.argv or "-v" in sys.argv
+    
+    if not check_setup(verbose=verbose):
+        print("Please fix the errors above before running.\n")
+        sys.exit(1)
+
+# Now import heavy dependencies (after setup check passes)
 import mujoco as mj
 import mujoco.viewer as mjv
 import numpy as np
@@ -39,9 +182,6 @@ from general_motion_retargeting import human_head_to_robot_neck
 
 from data_utils.params import DEFAULT_MIMIC_OBS
 from data_utils.rot_utils import euler_from_quaternion_np, quat_diff_np, quat_rotate_inverse_np
-
-# RoboMimic path (mounted in Docker container)
-ROBOMIMIC_PATH = "/workspace/RoboMimic_Deploy"
 
 
 class LocoModePolicy:
@@ -179,15 +319,23 @@ class HybridLocoTeleop:
         self.locomotion_enabled = False
         self.vel_cmd = np.zeros(3, dtype=np.float32)
         
+        # Height estimation
+        self.estimated_height = args.actual_human_height  # Start with default
+        self.height_samples = []  # Collect samples for averaging
+        self.height_estimation_done = False
+        self.height_estimation_frames = 0
+        self.retarget = None  # Will be initialized after height estimation
+        
         # Initialize systems
         print("\n[cyan]Initializing Hybrid Locomotion + Teleoperation...[/cyan]")
         self._setup_locomotion_policy()
         self._setup_teleop_streamer()
-        self._setup_retargeting()
+        # Don't setup retargeting yet - wait for height estimation
         self._setup_mujoco()
         self._setup_redis()
         
         print("\n[green]Systems initialized![/green]")
+        print(f"[yellow]Height estimation: Waiting for Pico data... (default: {self.estimated_height:.2f}m)[/yellow]")
         self._print_controls()
     
     def _setup_locomotion_policy(self):
@@ -201,25 +349,37 @@ class HybridLocoTeleop:
         self.teleop_streamer = XRobotStreamer()
         print("[green]XRobotStreamer initialized - waiting for Pico data[/green]")
     
-    def _setup_retargeting(self):
-        """Initialize GMR for upper body retargeting"""
-        print("\n[3/5] Setting up motion retargeting...")
-        self.retarget = GMR(
-            src_human="xrobot",
-            tgt_robot="unitree_g1",
-            height=self.args.actual_human_height,
-            fix_root=True
-        )
-        print("[green]GMR retargeting ready[/green]")
+    def _setup_retargeting(self, height=None):
+        """Initialize GMR for upper body retargeting with given height"""
+        if height is None:
+            height = self.estimated_height
+        
+        # Suppress GMR's verbose output (DoF names, body names, etc.)
+        import io
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            self.retarget = GMR(
+                src_human="xrobot",
+                tgt_robot="unitree_g1",
+                actual_human_height=height,
+            )
+        finally:
+            sys.stdout = old_stdout
     
     def _setup_mujoco(self):
         """Setup MuJoCo simulation for preview"""
         print("\n[4/5] Setting up MuJoCo preview...")
-        xml_path = ROBOT_XML_DICT["unitree_g1"]
+        xml_path = str(ROBOT_XML_DICT["unitree_g1"])
         self.model = mj.MjModel.from_xml_path(xml_path)
         self.data = mj.MjData(self.model)
-        self.data.qpos[7:] = DEFAULT_MIMIC_OBS[self.robot_name][6:]
-        self.last_qpos = self.data.qpos.copy()
+        # Don't set initial pose - let MuJoCo use model's default
+        # This prevents spasming legs before Pico data arrives
+        self.last_qpos = None  # Will be set on first valid frame
+        self._last_valid_qpos = None  # Will be set on first valid frame
+        self._using_fallback = False
+        # Get robot base body ID for camera tracking
+        self.robot_base_id = self.model.body("pelvis").id
         print("[green]MuJoCo ready[/green]")
     
     def _setup_redis(self):
@@ -236,7 +396,8 @@ class HybridLocoTeleop:
         print("="*60)
         print("\n[yellow]Controls:[/yellow]")
         print("  Right A button (key_one): Toggle preview/teleop mode")
-        print("  Left A button (key_one) : Exit program")
+        print("  B button (key_two)      : Exit program")
+        print("  Left A button (key_one) : Exit program (alternate)")
         print("  Left joystick           : Walk forward/back/strafe")
         print("  Right joystick          : Rotate left/right")
         print("  Right trigger           : HOLD to enable leg locomotion")
@@ -254,20 +415,21 @@ class HybridLocoTeleop:
     
     def get_teleop_data(self):
         """Get data from Pico VR"""
-        smplx_data = self.teleop_streamer.get_smplx_data()
-        left_hand = self.teleop_streamer.get_left_hand_data()
-        right_hand = self.teleop_streamer.get_right_hand_data()
-        controller = self.teleop_streamer.get_controller_data()
-        headset = self.teleop_streamer.get_headset_data()
-        return smplx_data, left_hand, right_hand, controller, headset
+        if self.teleop_streamer is not None:
+            return self.teleop_streamer.get_current_frame()
+        return None, None, None, None, None
     
     def update_state(self, controller_data):
         """Update state machine based on controller input"""
         if controller_data is None:
             return
         
+        # Controller data has nested structure: {'RightController': {...}, 'LeftController': {...}}
+        right_ctrl = controller_data.get("RightController", {})
+        left_ctrl = controller_data.get("LeftController", {})
+        
         # Right A button - toggle state
-        right_key_one = controller_data.get("key_one", False)
+        right_key_one = right_ctrl.get("key_one", False)
         if right_key_one and not self._right_key_was_pressed:
             if self.state == "idle":
                 self.state = "preview"
@@ -281,22 +443,29 @@ class HybridLocoTeleop:
         self._right_key_was_pressed = right_key_one
         
         # Left A button - exit
-        left_data = self.teleop_streamer.get_left_controller_data()
-        if left_data:
-            left_key_one = left_data.get("key_one", False)
-            if left_key_one:
-                self.state = "exit"
-                print("[red]→ EXIT requested[/red]")
+        left_key_one = left_ctrl.get("key_one", False)
+        if left_key_one and not self._left_key_was_pressed:
+            self.state = "exit"
+            print("\n→ EXIT requested (Left A)")
+        self._left_key_was_pressed = left_key_one
+        
+        # B button (key_two) on either controller - exit
+        right_key_two = right_ctrl.get("key_two", False)
+        left_key_two = left_ctrl.get("key_two", False)
+        if (right_key_two or left_key_two) and not self._b_key_was_pressed:
+            self.state = "exit"
+            print("\n→ EXIT requested (B button)")
+        self._b_key_was_pressed = right_key_two or left_key_two
         
         # Joystick for locomotion
-        axis = controller_data.get("axis", [0, 0])
-        left_axis = left_data.get("axis", [0, 0]) if left_data else [0, 0]
+        left_axis = left_ctrl.get("axis", [0, 0])
+        right_axis = right_ctrl.get("axis", [0, 0])
         
-        # Left joystick for movement (from left controller)
+        # Left joystick for movement
         self.vel_cmd[0] = left_axis[1]   # forward/backward
         self.vel_cmd[1] = -left_axis[0]  # strafe
         # Right joystick for rotation
-        self.vel_cmd[2] = -axis[0]       # yaw
+        self.vel_cmd[2] = -right_axis[0]  # yaw
         
         # Apply deadzone
         for i in range(3):
@@ -304,28 +473,84 @@ class HybridLocoTeleop:
                 self.vel_cmd[i] = 0.0
         
         # Right trigger enables locomotion
-        trigger_right = controller_data.get("trigger", 0.0)
+        trigger_right = right_ctrl.get("index_trig", 0.0)
+        if isinstance(trigger_right, bool):
+            trigger_right = 1.0 if trigger_right else 0.0
         self.locomotion_enabled = trigger_right > 0.5
+    
+    def _validate_quaternions(self, smplx_data):
+        """Check if smplx_data contains valid quaternions (non-zero norm)"""
+        if smplx_data is None:
+            return False
+        
+        # smplx_data is {joint_name: [[x,y,z], [w,x,y,z]], ...}
+        try:
+            for joint_name, value in smplx_data.items():
+                if isinstance(value, (list, tuple)) and len(value) == 2:
+                    pos, quat = value
+                    if isinstance(quat, (list, np.ndarray)) and len(quat) == 4:
+                        norm = np.linalg.norm(quat)
+                        if norm < 1e-6:
+                            return False
+            return True
+        except:
+            return False
+    
+    def _is_qpos_valid(self, qpos):
+        """Check if qpos contains valid values (no NaN/inf, reasonable bounds)"""
+        if qpos is None:
+            return False
+        if np.any(np.isnan(qpos)) or np.any(np.isinf(qpos)):
+            return False
+        # Check reasonable bounds (positions < 100m, angles < 2*pi)
+        if np.any(np.abs(qpos[:3]) > 100):  # root position
+            return False
+        if np.any(np.abs(qpos[7:]) > 10):  # joint angles
+            return False
+        return True
     
     def process_retargeting(self, smplx_data):
         """Run GMR retargeting on SMPLX data"""
-        qpos = self.retarget.retarget(smplx_data)
+        # Validate quaternions before processing
+        if not self._validate_quaternions(smplx_data):
+            # Return last known good qpos if available
+            self._using_fallback = True
+            return self._last_valid_qpos  # May be None if no valid frame yet
         
-        # If locomotion enabled, replace legs with LocoMode output
-        if self.locomotion_enabled:
-            # Get current state for locomotion policy
-            robot_qj = qpos[7:].copy()
-            robot_dqj = np.zeros(29)  # Approximate
-            ang_vel = np.zeros(3)
-            gravity_ori = np.array([0, 0, -1])
-            
-            # Compute leg positions from locomotion policy
-            loco_action = self.loco_policy.compute(
-                robot_qj, robot_dqj, ang_vel, gravity_ori, self.vel_cmd
-            )
-            
-            # Replace leg joints (0-11) with locomotion output
-            qpos[7:7+12] = loco_action[:12]
+        try:
+            # offset_to_ground=True shifts robot so feet are at ground level
+            # Without this, robot position = human's world position (could be anywhere)
+            qpos = self.retarget.retarget(smplx_data, offset_to_ground=True)
+        except ValueError as e:
+            # Catch quaternion errors - use fallback
+            if "zero norm" in str(e):
+                self._using_fallback = True
+                return self._last_valid_qpos
+            raise
+        except Exception:
+            # Any other error - use fallback
+            self._using_fallback = True
+            return self._last_valid_qpos
+        
+        # Validate qpos values
+        if not self._is_qpos_valid(qpos):
+            self._using_fallback = True
+            return self._last_valid_qpos
+        
+        # Save as last valid qpos
+        self._last_valid_qpos = qpos.copy()
+        self._using_fallback = False
+        
+        # For MuJoCo visualization only: use standing pose for legs
+        # The actual robot leg control is handled by sim2real with LocoMode + real robot state
+        standing_legs = np.array([
+            -0.2, 0.0, 0.0, 0.42, -0.23, 0.0,  # left leg
+            -0.2, 0.0, 0.0, 0.42, -0.23, 0.0,  # right leg
+        ], dtype=np.float32)
+        qpos[7:7+12] = standing_legs
+        
+        # Upper body (12-28) comes from GMR retargeting - this goes to sim2real via mimic_obs
+        # Legs (0-11) will be computed by LocoMode in sim2real with real robot state feedback
         
         return qpos
     
@@ -343,17 +568,67 @@ class HybridLocoTeleop:
                 json.dumps(neck_data)
             )
         
+        # Send velocity command for LocoMode (only when trigger held)
+        if self.locomotion_enabled:
+            self.redis_pipeline.set(
+                "loco_vel_cmd",
+                json.dumps(self.vel_cmd.tolist())
+            )
+        else:
+            # Zero velocity when not walking
+            self.redis_pipeline.set(
+                "loco_vel_cmd",
+                json.dumps([0.0, 0.0, 0.0])
+            )
+        
         t_action = int(time.time() * 1000)
         self.redis_pipeline.set("t_action", t_action)
         self.redis_pipeline.execute()
     
+    def _print_status(self, controller, smplx_data):
+        """Print live status on a single replacing line (max 79 chars for terminal)"""
+        # Build compact status string
+        p = "P" if smplx_data is not None else "-"
+        c = "C" if controller is not None else "-"
+        
+        # Get joystick values
+        lx, ly, rx = 0.0, 0.0, 0.0
+        trig = 0.0
+        if controller:
+            left_ctrl = controller.get("LeftController", {})
+            right_ctrl = controller.get("RightController", {})
+            left_axis = left_ctrl.get("axis", [0, 0])
+            right_axis = right_ctrl.get("axis", [0, 0])
+            lx, ly = left_axis[0] if len(left_axis) > 0 else 0, left_axis[1] if len(left_axis) > 1 else 0
+            rx = right_axis[0] if len(right_axis) > 0 else 0
+            trig = right_ctrl.get("index_trig", 0)
+            if isinstance(trig, bool):
+                trig = 1.0 if trig else 0.0
+        
+        loco = "W" if self.locomotion_enabled else "-"
+        fb = "F" if getattr(self, '_using_fallback', False) else "-"
+        # Compact: [state] P:- C:- L:(+0.0,+0.0) R:+0.0 T:0 W:- F:- v:(+0.0,+0.0,+0.0)
+        status = (f"[{self.state:7s}] {p}{c}{fb} "
+                  f"L:({lx:+.1f},{ly:+.1f}) R:{rx:+.1f} T:{trig:.0f} {loco} "
+                  f"v:({self.vel_cmd[0]:+.1f},{self.vel_cmd[1]:+.1f},{self.vel_cmd[2]:+.1f})")
+        
+        # Print with carriage return - keep under 80 chars
+        sys.stdout.write(f"\r{status:<79}")
+        sys.stdout.flush()
+    
     def run(self):
         """Main loop"""
+        # Suppress loop_rate_limiters warnings
+        import logging
+        logging.getLogger("loop_rate_limiters").setLevel(logging.ERROR)
+        
         rate = RateLimiter(frequency=self.args.target_fps)
         self._right_key_was_pressed = False
+        self._left_key_was_pressed = False
+        self._b_key_was_pressed = False
         
-        print(f"\n[yellow]Starting in state: {self.state}[/yellow]")
-        print("[cyan]Waiting for Pico VR data...[/cyan]\n")
+        print(f"\nStarting in state: {self.state}")
+        print("Waiting for Pico VR data...")
         
         with mjv.launch_passive(
             model=self.model, 
@@ -361,6 +636,8 @@ class HybridLocoTeleop:
             show_left_ui=False, 
             show_right_ui=False
         ) as viewer:
+            # Match original teleop settings
+            viewer.opt.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = 1
             
             while viewer.is_running() and self.state != "exit":
                 # Get Pico data
@@ -369,20 +646,34 @@ class HybridLocoTeleop:
                 # Update state machine
                 self.update_state(controller)
                 
+                # Print live status (replacing line)
+                self._print_status(controller, smplx_data)
+                
                 # Auto-transition from idle to preview when data arrives
                 if self.state == "idle" and smplx_data is not None:
                     self.state = "preview"
-                    print("[cyan]→ PREVIEW mode: Pico data received![/cyan]")
+                    print("\n→ PREVIEW mode: Pico data received!")
                 
                 # Process retargeting if we have data
                 if smplx_data is not None:
                     qpos = self.process_retargeting(smplx_data)
                     
+                    # Skip if no valid qpos yet
+                    if qpos is None:
+                        continue
+                    
                     # Update MuJoCo visualization
                     self.data.qpos[:] = qpos
                     mj.mj_forward(self.model, self.data)
                     
-                    # Extract mimic observations
+                    # Camera follows the robot
+                    robot_pos = self.data.xpos[self.robot_base_id]
+                    viewer.cam.lookat[:] = robot_pos
+                    viewer.cam.distance = 3.0
+                    
+                    # Extract mimic observations (use qpos as last_qpos if first frame)
+                    if self.last_qpos is None:
+                        self.last_qpos = qpos.copy()
                     mimic_obs = extract_mimic_obs(qpos, self.last_qpos, dt=1/self.args.target_fps)
                     self.last_qpos = qpos.copy()
                     
@@ -398,15 +689,10 @@ class HybridLocoTeleop:
                     if self.state == "teleop":
                         self.send_to_redis(mimic_obs, neck_data)
                 
-                # Show locomotion status in title
-                if self.locomotion_enabled:
-                    vel_str = f"vx={self.vel_cmd[0]:.2f} vy={self.vel_cmd[1]:.2f} vyaw={self.vel_cmd[2]:.2f}"
-                    # Note: Can't set title in passive viewer, but we print status
-                
                 viewer.sync()
                 rate.sleep()
         
-        print("\n[yellow]Exiting...[/yellow]")
+        print("\n\nExiting...")
 
 
 def parse_args():
@@ -415,6 +701,7 @@ def parse_args():
     parser.add_argument("--actual_human_height", type=float, default=1.65)
     parser.add_argument("--redis_ip", type=str, default="localhost")
     parser.add_argument("--target_fps", type=int, default=50)
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose setup output")
     return parser.parse_args()
 
 
