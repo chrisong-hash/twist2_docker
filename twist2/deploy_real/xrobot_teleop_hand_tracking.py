@@ -112,17 +112,31 @@ class HandGestureProcessor:
         return None
     
     def calculate_inspire_value(self, hand_data, finger, side):
-        """Calculate Inspire value (0-1000) for a finger"""
+        """Calculate Inspire value (0-1000) for a finger
+        0 = fully open, 1000 = fully closed
+        """
         tip_name = self.FINGER_TIPS[finger]
         tip = self.get_joint_position(hand_data, tip_name)
-        palm = self.get_joint_position(hand_data, 'Palm')
         
-        if tip is None or palm is None:
-            return self.prev_values[side].get(finger, 500)
+        # For thumb, use ThumbProximal as reference instead of palm
+        if finger == 'thumb':
+            ref = self.get_joint_position(hand_data, 'ThumbProximal')
+        else:
+            ref = self.get_joint_position(hand_data, 'Palm')
         
-        distance = np.linalg.norm(tip - palm)
+        if tip is None or ref is None:
+            return self.prev_values[side].get(finger, 0)  # Default to open
+        
+        distance = np.linalg.norm(tip - ref)
         min_ext = self.min_extension[finger]
         max_ext = self.max_extension[finger]
+        
+        # Normalize: small distance (closed) → high value, large distance (open) → low value
+        # Ensure we have valid range
+        if max_ext <= min_ext:
+            # Fallback to defaults if calibration failed
+            max_ext = self.max_extension.get(finger, 0.15)
+            min_ext = self.min_extension.get(finger, 0.05)
         
         normalized = (max_ext - distance) / (max_ext - min_ext)
         normalized = np.clip(normalized, 0.0, 1.0)
@@ -163,9 +177,22 @@ class HandGestureProcessor:
         print("You'll do 2 poses per hand: CLOSED FIST and OPEN PALM")
         print("\n⚠️  Make sure Pico hand tracking is visible in XRoboToolkit!")
         
-        # Wait for hand tracking to be available
+        # Prompt user if they want to calibrate
+        while True:
+            response = input("\nDo you want to calibrate hand tracking? (yes/no): ").strip().lower()
+            if response in ['yes', 'y']:
+                break
+            elif response in ['no', 'n']:
+                print("Skipping calibration - using default values")
+                return
+            else:
+                print("Please enter 'yes' or 'no'")
+        
+        # Wait for hand tracking to be available (keep waiting until data is received)
         print("\nWaiting for hand tracking data...")
-        for i in range(50):  # Try for ~5 seconds
+        print("   (Make sure your hands are visible in XRoboToolkit)")
+        wait_count = 0
+        while True:
             try:
                 _, left_tuple, right_tuple, _, _ = streamer.get_current_frame()
                 # left_tuple is (is_active, hand_data_dict)
@@ -175,15 +202,13 @@ class HandGestureProcessor:
                     print("✓ Hand tracking detected!")
                     break
             except Exception as e:
-                if i == 0:
+                if wait_count == 0:
                     print(f"   Debug: {e}")
             time.sleep(0.1)
-            if i % 10 == 0:
-                print(f"   Still waiting... ({i//10}s)")
-        else:
-            print("⚠️  No hand data received - continuing with defaults")
-            print("   (Check if hands are visible in XRoboToolkit)")
-            return
+            wait_count += 1
+            if wait_count % 100 == 0:  # Every 10 seconds
+                print(f"   Still waiting... ({wait_count//10}s)")
+                print("   (Make sure your hands are visible in XRoboToolkit)")
         
         calibration_data = {
             'left': {'closed': {}, 'open': {}},
@@ -218,8 +243,12 @@ class HandGestureProcessor:
                         
                         for finger in self.INSPIRE_ORDER:
                             tip = self.get_joint_position(hand_data, self.FINGER_TIPS[finger])
-                            if tip is not None and palm is not None:
-                                sample[finger] = np.linalg.norm(tip - palm)
+                            if finger == 'thumb':
+                                ref = self.get_joint_position(hand_data, 'ThumbProximal')
+                            else:
+                                ref = palm
+                            if tip is not None and ref is not None:
+                                sample[finger] = np.linalg.norm(tip - ref)
                         
                         # Thumb rotation
                         thumb_prox = self.get_joint_position(hand_data, 'ThumbProximal')
@@ -265,8 +294,12 @@ class HandGestureProcessor:
                         
                         for finger in self.INSPIRE_ORDER:
                             tip = self.get_joint_position(hand_data, self.FINGER_TIPS[finger])
-                            if tip is not None and palm is not None:
-                                sample[finger] = np.linalg.norm(tip - palm)
+                            if finger == 'thumb':
+                                ref = self.get_joint_position(hand_data, 'ThumbProximal')
+                            else:
+                                ref = palm
+                            if tip is not None and ref is not None:
+                                sample[finger] = np.linalg.norm(tip - ref)
                         
                         thumb_prox = self.get_joint_position(hand_data, 'ThumbProximal')
                         if thumb_prox is not None and palm is not None:
@@ -324,8 +357,34 @@ class HandGestureProcessor:
         print("\n✅ Calibration complete!")
         print("="*60 + "\n")
     
+    def get_thumb_debug(self, hand_data, side):
+        """Get debug info for thumb calculation"""
+        thumb_tip = self.get_joint_position(hand_data, 'ThumbTip')
+        thumb_prox = self.get_joint_position(hand_data, 'ThumbProximal')
+        index_meta = self.get_joint_position(hand_data, 'IndexMetacarpal')
+        palm = self.get_joint_position(hand_data, 'Palm')
+        
+        if any(x is None for x in [thumb_tip, thumb_prox, index_meta, palm]):
+            return None
+        
+        return {
+            'thumb_tip': thumb_tip,
+            'thumb_prox': thumb_prox,
+            'index_meta': index_meta,
+            'palm': palm,
+            'tip_to_index': np.linalg.norm(thumb_tip - index_meta),
+            'prox_to_palm': np.linalg.norm(thumb_prox - palm),
+            'tip_to_palm': np.linalg.norm(thumb_tip - palm),
+            'tip_to_prox': np.linalg.norm(thumb_tip - thumb_prox),  # Thumb bend distance
+        }
+    
     def process_hand(self, hand_data, side):
-        """Process hand data into 6 DOF Inspire values"""
+        """Process hand data into 6 DOF Inspire values
+        Returns: [Little, Ring, Middle, Index, ThumbBend, ThumbRot]
+        
+        Note: ThumbBend uses the thumb extension value (ThumbTip to ThumbProximal distance)
+        from the loop - same as hand_teleop.py
+        """
         if not hand_data:
             return None
         
@@ -334,24 +393,101 @@ class HandGestureProcessor:
             val = self.calculate_inspire_value(hand_data, finger, side)
             values.append(val)
         
-        # Thumb bend (tip to proximal distance)
-        thumb_tip = self.get_joint_position(hand_data, 'ThumbTip')
-        thumb_prox = self.get_joint_position(hand_data, 'ThumbProximal')
-        if thumb_tip is not None and thumb_prox is not None:
-            dist = np.linalg.norm(thumb_tip - thumb_prox)
-            normalized = (0.04 - dist) / (0.04 - 0.015)
-            normalized = np.clip(normalized, 0.0, 1.0)
-            thumb_bend = int(normalized * self.INSPIRE_MAX)
-        else:
-            thumb_bend = 0
-        
+        # Thumb rotation
         thumb_rot = self.calculate_thumb_rotation(hand_data, side)
         
-        # Replace thumb value with bend, add rotation
-        values[4] = thumb_bend  # ThumbBend
+        # ThumbBend is already in values[4] from the loop (ThumbTip to ThumbProximal)
+        # Just add thumb rotation
         values.append(thumb_rot)  # ThumbRot (6th DOF)
         
         return values
+
+
+class MotionDampener:
+    """Adaptive motion dampening to prevent jerky motion from lag spikes"""
+    
+    def __init__(self, max_velocity=0.5, max_acceleration=2.0, dt=0.01, fps_threshold=60.0):
+        """
+        Args:
+            max_velocity: Maximum change per dimension per second (hard limit fallback)
+            max_acceleration: Maximum change in velocity per second (hard limit fallback)
+            dt: Expected time step in seconds
+            fps_threshold: FPS threshold for adaptive dampening (default: 60Hz)
+        """
+        self.max_velocity = max_velocity
+        self.max_acceleration = max_acceleration
+        self.dt = dt
+        self.fps_threshold = fps_threshold
+        self.dt_threshold = 1.0 / fps_threshold  # dt for 60Hz = ~0.0167s
+        self.prev_obs = None
+        self.prev_velocity = None
+        
+    def dampen(self, current_obs, measured_dt):
+        """
+        Apply adaptive velocity and acceleration limiting to observations
+        
+        Args:
+            current_obs: Current observation array (35D mimic obs)
+            measured_dt: Measured time delta from frame-to-frame (for latency detection)
+            
+        Returns:
+            Dampened observation array
+        """
+        if current_obs is None:
+            return None
+        
+        current_obs = np.array(current_obs)
+        
+        # First frame - no dampening
+        if self.prev_obs is None:
+            self.prev_obs = current_obs.copy()
+            self.prev_velocity = np.zeros_like(current_obs)
+            return current_obs
+        
+        # Adaptive dampening: if measured_dt > threshold (fps < 60Hz), increase dampening
+        if measured_dt > self.dt_threshold:
+            # Low FPS detected - apply more aggressive dampening
+            # Scale down velocity and acceleration limits
+            fps_ratio = self.dt_threshold / measured_dt  # < 1.0 when laggy
+            adaptive_max_velocity = self.max_velocity * fps_ratio
+            adaptive_max_acceleration = self.max_acceleration * fps_ratio
+        else:
+            # High FPS (>= 60Hz) - use minimal dampening (just hard limits)
+            adaptive_max_velocity = self.max_velocity
+            adaptive_max_acceleration = self.max_acceleration
+        
+        # Calculate desired velocity (change from previous)
+        actual_dt = measured_dt if measured_dt > 0 else self.dt
+        desired_velocity = (current_obs - self.prev_obs) / actual_dt
+        
+        # Limit acceleration
+        max_velocity_change = adaptive_max_acceleration * actual_dt
+        velocity_change = desired_velocity - self.prev_velocity
+        velocity_change = np.clip(velocity_change, -max_velocity_change, max_velocity_change)
+        limited_velocity = self.prev_velocity + velocity_change
+        
+        # Limit velocity magnitude per dimension
+        limited_velocity = np.clip(limited_velocity, -adaptive_max_velocity, adaptive_max_velocity)
+        
+        # Apply velocity to get new position
+        dampened_obs = self.prev_obs + limited_velocity * actual_dt
+        
+        # Update state
+        self.prev_obs = dampened_obs.copy()
+        self.prev_velocity = limited_velocity.copy()
+        
+        return dampened_obs
+    
+    def reset(self):
+        """Reset dampener state"""
+        self.prev_obs = None
+        self.prev_velocity = None
+    
+    def get_latency_info(self, measured_dt):
+        """Get latency information for display"""
+        fps = 1.0 / measured_dt if measured_dt > 0 else 0.0
+        latency_ms = measured_dt * 1000.0
+        return fps, latency_ms
 
 
 class ClapDetector:
@@ -367,8 +503,30 @@ class ClapDetector:
         if not left_hand_data or not right_hand_data:
             return False
         
-        left_palm = gesture_processor.get_joint_position(left_hand_data, 'Palm')
-        right_palm = gesture_processor.get_joint_position(right_hand_data, 'Palm')
+        # Handle tuple format: (is_active, hand_data_dict)
+        left_hand_dict = None
+        right_hand_dict = None
+        
+        if isinstance(left_hand_data, tuple):
+            left_is_active, left_hand_dict = left_hand_data
+            if not left_is_active:
+                return False
+        elif isinstance(left_hand_data, dict):
+            left_hand_dict = left_hand_data
+        else:
+            return False
+            
+        if isinstance(right_hand_data, tuple):
+            right_is_active, right_hand_dict = right_hand_data
+            if not right_is_active:
+                return False
+        elif isinstance(right_hand_data, dict):
+            right_hand_dict = right_hand_data
+        else:
+            return False
+        
+        left_palm = gesture_processor.get_joint_position(left_hand_dict, 'Palm')
+        right_palm = gesture_processor.get_joint_position(right_hand_dict, 'Palm')
         
         if left_palm is None or right_palm is None:
             return False
@@ -743,6 +901,19 @@ class XRobotTeleopToRobot:
         self.gesture_processor = HandGestureProcessor()
         self.clap_detector = ClapDetector()
         self.is_paused_by_clap = False
+        
+        # Motion dampening (for lag spike mitigation)
+        enable_dampening = getattr(args, 'enable_dampening', True)
+        max_velocity = getattr(args, 'max_velocity', 0.5)
+        max_acceleration = getattr(args, 'max_acceleration', 2.0)
+        fps_threshold = getattr(args, 'fps_threshold', 60.0)
+        dt = 1.0 / self.target_fps
+        self.motion_dampener = MotionDampener(
+            max_velocity=max_velocity,
+            max_acceleration=max_acceleration,
+            dt=dt,
+            fps_threshold=fps_threshold
+        ) if enable_dampening else None
 
     def setup_teleop_data_streamer(self):
         """Initialize and start the teleop data streamer"""
@@ -809,17 +980,107 @@ class XRobotTeleopToRobot:
                 timeout=3.0
             )
             
-            # Open both hands initially
+            # Wait for connection to stabilize
             time.sleep(0.5)
-            self.inspire_hand_controller.open_both()
-            print("[INSPIRE] ✓ Inspire hands connected and opened")
+            
+            # Test sequence: open → close → open
+            print("[INSPIRE] Running startup test sequence...")
+            print("[INSPIRE]   Opening hands...")
+            try:
+                self.inspire_hand_controller.open_both()
+                time.sleep(1.0)
+            except Exception as e:
+                print(f"[INSPIRE]   ⚠️  Error opening hands: {e}")
+            
+            print("[INSPIRE]   Closing hands...")
+            try:
+                self.inspire_hand_controller.close_both()
+                time.sleep(1.0)
+            except Exception as e:
+                print(f"[INSPIRE]   ⚠️  Error closing hands: {e}")
+            
+            print("[INSPIRE]   Opening hands again...")
+            try:
+                self.inspire_hand_controller.open_both()
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"[INSPIRE]   ⚠️  Error opening hands: {e}")
+            
+            print("[INSPIRE] ✓ Inspire hands connected and tested")
             print("[INSPIRE] ✓ Pico hand tracking enabled")
             
         except Exception as e:
             print(f"[INSPIRE] ✗ Failed to connect: {e}")
+            print(f"[INSPIRE]   Error type: {type(e).__name__}")
+            import traceback
+            print(f"[INSPIRE]   Traceback:")
+            traceback.print_exc()
             print("[INSPIRE]   Make sure you can ping 192.168.123.210/211 from host")
             self.inspire_hand_controller = None
             self.use_inspire_hands = False
+    
+    def _display_thumb_debug(self, left_hand_data, right_hand_data):
+        """Display thumb debug info (replacing output, pauses other prints)"""
+        # Clear screen and show thumb debug
+        print("\033[H\033[J", end="")
+        
+        hand_data_list = [('LEFT', left_hand_data), ('RIGHT', right_hand_data)]
+        
+        for side, hand_data in hand_data_list:
+            print(f"\n{'='*70}")
+            print(f"{side} HAND DEBUG")
+            print(f"{'='*70}")
+            
+            if hand_data:
+                # Handle tuple format
+                hand_dict = None
+                if isinstance(hand_data, tuple):
+                    is_active, hand_dict = hand_data
+                    if not is_active:
+                        print(f"{side} hand: Not active")
+                        continue
+                elif isinstance(hand_data, dict):
+                    hand_dict = hand_data
+                else:
+                    print(f"{side} hand: Invalid format")
+                    continue
+                
+                # Get processed values
+                values = self.gesture_processor.process_hand(hand_dict, side.lower())
+                if values:
+                    dof_names = ['Little', 'Ring', 'Middle', 'Index', 'ThumbBend', 'ThumbRot']
+                    print(f"\nDOF Values:")
+                    for i, name in enumerate(dof_names):
+                        val = values[i]
+                        bar_len = int(val / 50)
+                        bar = '█' * bar_len + '░' * (20 - bar_len)
+                        print(f"  {name:10} {val:4} [{bar}]")
+                
+                # Get thumb debug info
+                debug = self.gesture_processor.get_thumb_debug(hand_dict, side.lower())
+                if debug:
+                    print(f"\n--- THUMB DEBUG ---")
+                    print(f"ThumbTip pos:    [{debug['thumb_tip'][0]*100:.1f}, {debug['thumb_tip'][1]*100:.1f}, {debug['thumb_tip'][2]*100:.1f}] cm")
+                    print(f"ThumbProx pos:   [{debug['thumb_prox'][0]*100:.1f}, {debug['thumb_prox'][1]*100:.1f}, {debug['thumb_prox'][2]*100:.1f}] cm")
+                    print(f"IndexMeta pos:   [{debug['index_meta'][0]*100:.1f}, {debug['index_meta'][1]*100:.1f}, {debug['index_meta'][2]*100:.1f}] cm")
+                    print(f"Palm pos:        [{debug['palm'][0]*100:.1f}, {debug['palm'][1]*100:.1f}, {debug['palm'][2]*100:.1f}] cm")
+                    print(f"---")
+                    print(f"ThumbTip→IndexMeta dist: {debug['tip_to_index']*100:.2f} cm")
+                    print(f"ThumbProx→Palm dist:     {debug['prox_to_palm']*100:.2f} cm")
+                    print(f"ThumbTip→Palm dist:      {debug['tip_to_palm']*100:.2f} cm")
+                    print(f"ThumbTip→Prox dist:      {debug['tip_to_prox']*100:.2f} cm (BEND)")
+                    print(f"---")
+                    print(f"Calib max_dist: {self.gesture_processor.thumb_rot_max_dist*100:.2f} cm")
+                    print(f"Calib min_dist: {self.gesture_processor.thumb_rot_min_dist*100:.2f} cm")
+                    print(f"Thumb extension min: {self.gesture_processor.min_extension['thumb']*100:.2f} cm")
+                    print(f"Thumb extension max: {self.gesture_processor.max_extension['thumb']*100:.2f} cm")
+                else:
+                    print(f"{side} hand: Missing joint data for debug")
+            else:
+                print(f"{side} hand: Not detected")
+        
+        print(f"\n{'='*70}")
+        print("Press Ctrl+C to exit")
     
     def control_inspire_hands(self, left_hand_data, right_hand_data):
         """Control Inspire hands using Pico hand tracking - direct Modbus connection"""
@@ -827,9 +1088,32 @@ class XRobotTeleopToRobot:
             return
         
         try:
+            # Handle tuple format: (is_active, hand_data_dict)
+            left_hand_dict = None
+            right_hand_dict = None
+            
+            if isinstance(left_hand_data, tuple):
+                left_is_active, left_hand_dict = left_hand_data
+                if not left_is_active:
+                    left_hand_dict = None
+            elif isinstance(left_hand_data, dict):
+                left_hand_dict = left_hand_data
+                
+            if isinstance(right_hand_data, tuple):
+                right_is_active, right_hand_dict = right_hand_data
+                if not right_is_active:
+                    right_hand_dict = None
+            elif isinstance(right_hand_data, dict):
+                right_hand_dict = right_hand_data
+            
             # Process hand tracking data into Inspire values (0-1000 for each DOF)
-            left_values = self.gesture_processor.process_hand(left_hand_data, 'left')
-            right_values = self.gesture_processor.process_hand(right_hand_data, 'right')
+            left_values = None
+            right_values = None
+            
+            if left_hand_dict:
+                left_values = self.gesture_processor.process_hand(left_hand_dict, 'left')
+            if right_hand_dict:
+                right_values = self.gesture_processor.process_hand(right_hand_dict, 'right')
             
             # Convert to raw angles (0-2000) and send directly to hands
             # Our values: 0=open, 1000=closed
@@ -845,8 +1129,13 @@ class XRobotTeleopToRobot:
                 self.inspire_hand_controller.right_hand.set_angles(right_raw)
             
         except Exception as e:
-            # Don't spam errors - just silently retry next frame
-            pass
+            # Print error occasionally (not every frame to avoid spam)
+            if not hasattr(self, '_last_inspire_error_time'):
+                self._last_inspire_error_time = 0
+            current_time = time.time()
+            if current_time - self._last_inspire_error_time > 5.0:  # Print max once per 5 seconds
+                print(f"[INSPIRE] ⚠️  Error controlling hands: {e}")
+                self._last_inspire_error_time = current_time
         
     def get_teleop_data(self):
         """Get current teleop data from streamer"""
@@ -934,6 +1223,9 @@ class XRobotTeleopToRobot:
         """Handle entering teleop state"""
         if previous_state in ["idle", "pause"]:
             self.state_machine.reset_smooth_history()
+            # Reset motion dampener when entering teleop
+            if self.motion_dampener is not None:
+                self.motion_dampener.reset()
             print("Reset smooth history on entering teleop")
 
         if previous_state == "idle":
@@ -970,6 +1262,9 @@ class XRobotTeleopToRobot:
         elif current_state == "teleop":
             obs = self._get_teleop_mimic_obs(current_retarget_obs)
             obs = self.state_machine.apply_smooth(obs)
+            # Apply motion dampening to prevent sudden jerks from lag spikes
+            if self.motion_dampener is not None:
+                obs = self.motion_dampener.dampen(obs, self.measured_dt)
         else:
             obs = DEFAULT_MIMIC_OBS[self.robot_name]
 
@@ -1118,6 +1413,12 @@ class XRobotTeleopToRobot:
         else:
             print("- Smooth filtering: DISABLED")
         
+        if self.motion_dampener is not None:
+            print(f"- Motion dampening: ENABLED (adaptive, threshold: {self.motion_dampener.fps_threshold}Hz)")
+            print(f"  Hard limits: max_velocity={self.motion_dampener.max_velocity}, max_acceleration={self.motion_dampener.max_acceleration}")
+        else:
+            print("- Motion dampening: DISABLED")
+        
         if self.fps_monitor.enable_detailed_stats:
             print(f"- FPS measurement: ENABLED (detailed stats every {self.fps_monitor.detailed_print_interval} steps)")
         else:
@@ -1166,14 +1467,20 @@ class XRobotTeleopToRobot:
                     current_state = self.state_machine.state
                     if current_state == "teleop":
                         self.state_machine.state = "pause"
-                        print("👏 CLAP - PAUSED (body + hands frozen)")
+                        print("\n" + "="*70)
+                        print("👏 CLAP DETECTED - PAUSED (body + hands frozen)")
+                        print("="*70 + "\n")
                     elif current_state == "pause":
                         self.state_machine.state = "teleop"
-                        print("👏 CLAP - RESUMED")
+                        print("\n" + "="*70)
+                        print("👏 CLAP DETECTED - RESUMED")
+                        print("="*70 + "\n")
                     elif current_state == "idle":
                         # From idle, clap starts teleop
                         self.state_machine.state = "teleop"
-                        print("👏 CLAP - STARTING TELEOP")
+                        print("\n" + "="*70)
+                        print("👏 CLAP DETECTED - STARTING TELEOP")
+                        print("="*70 + "\n")
                 
                 # Control Inspire hands with Pico tracking (skip if paused)
                 if self.state_machine.state == "teleop":
@@ -1208,8 +1515,17 @@ class XRobotTeleopToRobot:
                 viewer.sync()
                 self.record_video_frame(viewer)
                 
-                # FPS monitoring
-                self.fps_monitor.tick()
+                # FPS monitoring (suppress print if showing thumb debug)
+                if self.use_inspire_hands and self.state_machine.state == "teleop":
+                    # Show thumb debug display (replacing output, pauses other prints)
+                    self._display_thumb_debug(left_hand_data, right_hand_data)
+                else:
+                    # FPS monitoring
+                    self.fps_monitor.tick()
+                    # Print latency info (replacing output) - only if not showing thumb debug
+                    if self.motion_dampener is not None and self.state_machine.state == "teleop":
+                        fps, latency_ms = self.motion_dampener.get_latency_info(self.measured_dt)
+                        print(f"\r[Latency] FPS: {fps:.1f}Hz | dt: {latency_ms:.1f}ms", end="", flush=True)
                 
                 self.rate.sleep()
 
@@ -1295,7 +1611,40 @@ def parse_arguments():
         action="store_true",
         help="Skip hand calibration (use default values).",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--enable_dampening",
+        action="store_true",
+        default=True,
+        help="Enable motion dampening to prevent jerky motion from lag spikes (default: True).",
+    )
+    parser.add_argument(
+        "--disable_dampening",
+        action="store_true",
+        help="Disable motion dampening.",
+    )
+    parser.add_argument(
+        "--max_velocity",
+        type=float,
+        default=0.5,
+        help="Maximum velocity per dimension per second for motion dampening (default: 0.5).",
+    )
+    parser.add_argument(
+        "--max_acceleration",
+        type=float,
+        default=2.0,
+        help="Maximum acceleration per dimension per second^2 for motion dampening (default: 2.0).",
+    )
+    parser.add_argument(
+        "--fps_threshold",
+        type=float,
+        default=60.0,
+        help="FPS threshold for adaptive dampening - below this FPS, more aggressive dampening is applied (default: 60.0).",
+    )
+    args = parser.parse_args()
+    # Handle disable_dampening flag
+    if args.disable_dampening:
+        args.enable_dampening = False
+    return args
 
 if __name__ == "__main__":
     args = parse_arguments()
