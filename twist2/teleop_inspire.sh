@@ -19,7 +19,7 @@ eval "$(conda shell.bash hook)"
 conda activate gmr
 
 # Configuration
-actual_human_height=1.65
+actual_human_height=1.80
 redis_ip="localhost"
 
 # Inspire hand IPs

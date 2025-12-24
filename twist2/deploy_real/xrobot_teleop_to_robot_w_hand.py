@@ -1,7 +1,7 @@
 """
 conda activate gmr
 sudo ufw disable
-python xrobot_teleop_to_robot_w_hand.py --robot unitree_g1
+python xrobot_teleop_to_robot_w_hand.py --robot unitree_g1 --use_inspire_hands
 
 State Machine Controls:
 - Right controller key_one: Cycle through idle -> teleop -> pause -> teleop...
@@ -9,6 +9,8 @@ State Machine Controls:
 - Left controller axis_click: Emergency stop - kills sim2real.sh process
 - Left controller axis: Control root xy velocity and yaw velocity
 - Right controller axis: Fine-tune root xy velocity and yaw velocity
+- Triggers: Control robot hand poses (sent to Redis)
+- 👏 Clap: Pause/Resume (safety feature)
 - Auto-transition: idle -> teleop when motion data is available
 
 States:
@@ -21,6 +23,8 @@ Whole-Body Teleop Features:
 - Sends whole-body mode information to Redis
 - 35-dimensional mimic observations
 - Uses retargeted motion directly from the teleoperation stream
+- Triggers control robot hand poses (sent to Redis)
+- Pico hand tracking controls Inspire hands directly (when --use_inspire_hands enabled)
 """
 import argparse
 import json
@@ -49,6 +53,352 @@ from general_motion_retargeting import XRobotStreamer
 from data_utils.params import DEFAULT_MIMIC_OBS, DEFAULT_HAND_POSE
 from data_utils.rot_utils import euler_from_quaternion_np, quat_diff_np, quat_rotate_inverse_np
 from data_utils.fps_monitor import FPSMonitor
+from robot_control.inspire_hand_wrapper import DualHandController
+
+
+class HandGestureProcessor:
+    """Process Pico hand tracking data into Inspire hand values"""
+    
+    FINGER_TIPS = {
+        'thumb': 'ThumbTip', 'index': 'IndexTip', 'middle': 'MiddleTip',
+        'ring': 'RingTip', 'little': 'LittleTip'
+    }
+    INSPIRE_ORDER = ['little', 'ring', 'middle', 'index', 'thumb']
+    INSPIRE_MAX = 1000
+    
+    def __init__(self):
+        # Calibrated values from testing
+        self.max_extension = {
+            'thumb': 0.05, 'index': 0.18, 'middle': 0.19, 'ring': 0.17, 'little': 0.15
+        }
+        self.min_extension = {
+            'thumb': 0.02, 'index': 0.05, 'middle': 0.05, 'ring': 0.05, 'little': 0.05
+        }
+        self.thumb_rot_max_dist = 0.065  # 6.5cm
+        self.thumb_rot_min_dist = 0.054  # 5.4cm
+        self.smoothing_alpha = 0.3
+        self.prev_values = {'left': {}, 'right': {}}
+    
+    def get_joint_position(self, hand_data, joint_name):
+        """Get 3D position of a joint from hand data
+        
+        XRobotStreamer format: {"LeftHandPalm": [[x,y,z], [qw,qx,qy,qz]], ...}
+        or with side prefix removed: {"Palm": [[x,y,z], [qw,qx,qy,qz]], ...}
+        """
+        if not hand_data:
+            return None
+        
+        # Try different key formats
+        possible_keys = [
+            joint_name,                    # "Palm"
+            f"LeftHand{joint_name}",       # "LeftHandPalm"
+            f"RightHand{joint_name}",     # "RightHandPalm"
+        ]
+        
+        for key in possible_keys:
+            if key in hand_data:
+                data = hand_data[key]
+                # Format: [[x, y, z], [qw, qx, qy, qz]] or {'position': {...}}
+                if isinstance(data, list) and len(data) >= 1:
+                    pos = data[0]  # First element is position [x, y, z]
+                    if isinstance(pos, (list, np.ndarray)) and len(pos) >= 3:
+                        return np.array([pos[0], pos[1], pos[2]])
+                elif isinstance(data, dict) and 'position' in data:
+                    pos = data['position']
+                    return np.array([pos.get('x', 0), pos.get('y', 0), pos.get('z', 0)])
+        
+        # Legacy format with 'joints' list
+        if 'joints' in hand_data:
+            for joint in hand_data['joints']:
+                if joint.get('name') == joint_name:
+                    pos = joint.get('position', {})
+                    return np.array([pos.get('x', 0), pos.get('y', 0), pos.get('z', 0)])
+        
+        return None
+    
+    def calculate_inspire_value(self, hand_data, finger, side):
+        """Calculate Inspire value (0-1000) for a finger"""
+        tip_name = self.FINGER_TIPS[finger]
+        tip = self.get_joint_position(hand_data, tip_name)
+        palm = self.get_joint_position(hand_data, 'Palm')
+        
+        if tip is None or palm is None:
+            return self.prev_values[side].get(finger, 500)
+        
+        distance = np.linalg.norm(tip - palm)
+        min_ext = self.min_extension[finger]
+        max_ext = self.max_extension[finger]
+        
+        normalized = (max_ext - distance) / (max_ext - min_ext)
+        normalized = np.clip(normalized, 0.0, 1.0)
+        value = int(normalized * self.INSPIRE_MAX)
+        
+        # Smoothing
+        if finger in self.prev_values[side]:
+            value = int(self.smoothing_alpha * value + 
+                       (1 - self.smoothing_alpha) * self.prev_values[side][finger])
+        self.prev_values[side][finger] = value
+        return value
+    
+    def calculate_thumb_rotation(self, hand_data, side):
+        """Calculate thumb rotation value (0-1000)"""
+        thumb_prox = self.get_joint_position(hand_data, 'ThumbProximal')
+        palm = self.get_joint_position(hand_data, 'Palm')
+        
+        if thumb_prox is None or palm is None:
+            return self.prev_values[side].get('thumb_rot', 500)
+        
+        dist = np.linalg.norm(thumb_prox - palm)
+        normalized = (self.thumb_rot_max_dist - dist) / (self.thumb_rot_max_dist - self.thumb_rot_min_dist)
+        normalized = np.clip(normalized, 0.0, 1.0)
+        thumb_rot = int(normalized * self.INSPIRE_MAX)
+        
+        if 'thumb_rot' in self.prev_values[side]:
+            thumb_rot = int(self.smoothing_alpha * thumb_rot +
+                          (1 - self.smoothing_alpha) * self.prev_values[side]['thumb_rot'])
+        self.prev_values[side]['thumb_rot'] = thumb_rot
+        return thumb_rot
+    
+    def calibrate(self, streamer):
+        """Interactive calibration for hand tracking"""
+        print("\n" + "="*60)
+        print("🖐️  HAND CALIBRATION")
+        print("="*60)
+        print("\nThis calibrates finger tracking for your hand size.")
+        print("You'll do 2 poses per hand: CLOSED FIST and OPEN PALM")
+        print("\n⚠️  Make sure Pico hand tracking is visible in XRoboToolkit!")
+        
+        # Wait for hand tracking to be available
+        print("\nWaiting for hand tracking data...")
+        for i in range(50):  # Try for ~5 seconds
+            try:
+                _, left_tuple, right_tuple, _, _ = streamer.get_current_frame()
+                # left_tuple is (is_active, hand_data_dict)
+                left_active = left_tuple[0] if left_tuple else False
+                right_active = right_tuple[0] if right_tuple else False
+                if left_active or right_active:
+                    print("✓ Hand tracking detected!")
+                    break
+            except Exception as e:
+                if i == 0:
+                    print(f"   Debug: {e}")
+            time.sleep(0.1)
+            if i % 10 == 0:
+                print(f"   Still waiting... ({i//10}s)")
+        else:
+            print("⚠️  No hand data received - continuing with defaults")
+            print("   (Check if hands are visible in XRoboToolkit)")
+            return
+        
+        calibration_data = {
+            'left': {'closed': {}, 'open': {}},
+            'right': {'closed': {}, 'open': {}}
+        }
+        
+        for side in ['left', 'right']:
+            print(f"\n{'='*40}")
+            print(f"  {side.upper()} HAND CALIBRATION")
+            print(f"{'='*40}")
+            
+            # CLOSED FIST
+            print(f"\n1️⃣  Make a CLOSED FIST with {side} hand")
+            print("   (thumb tucked into palm)")
+            input("   Press ENTER when ready...")
+            
+            # Sample for 1 second
+            print("   Sampling", end="", flush=True)
+            samples = []
+            for i in range(30):
+                try:
+                    _, left_tuple, right_tuple, _, _ = streamer.get_current_frame()
+                    # Tuples are (is_active, hand_data_dict)
+                    if side == 'left':
+                        is_active, hand_data = left_tuple if left_tuple else (False, {})
+                    else:
+                        is_active, hand_data = right_tuple if right_tuple else (False, {})
+                    
+                    if is_active and hand_data:
+                        sample = {}
+                        palm = self.get_joint_position(hand_data, 'Palm')
+                        
+                        for finger in self.INSPIRE_ORDER:
+                            tip = self.get_joint_position(hand_data, self.FINGER_TIPS[finger])
+                            if tip is not None and palm is not None:
+                                sample[finger] = np.linalg.norm(tip - palm)
+                        
+                        # Thumb rotation
+                        thumb_prox = self.get_joint_position(hand_data, 'ThumbProximal')
+                        if thumb_prox is not None and palm is not None:
+                            sample['thumb_rot'] = np.linalg.norm(thumb_prox - palm)
+                        
+                        if sample:
+                            samples.append(sample)
+                            if i % 10 == 0:
+                                print(".", end="", flush=True)
+                except Exception as e:
+                    pass
+                time.sleep(0.033)
+            
+            print()  # Newline after dots
+            if samples:
+                for key in samples[0].keys():
+                    vals = [s[key] for s in samples if key in s]
+                    if vals:
+                        calibration_data[side]['closed'][key] = np.mean(vals)
+                print(f"   ✓ Closed fist recorded ({len(samples)} samples)")
+            else:
+                print(f"   ⚠️  No {side} hand data - using defaults")
+            
+            # OPEN PALM
+            print(f"\n2️⃣  OPEN your {side} hand fully")
+            print("   (fingers spread, thumb out)")
+            input("   Press ENTER when ready...")
+            
+            print("   Sampling", end="", flush=True)
+            samples = []
+            for i in range(30):
+                try:
+                    _, left_tuple, right_tuple, _, _ = streamer.get_current_frame()
+                    if side == 'left':
+                        is_active, hand_data = left_tuple if left_tuple else (False, {})
+                    else:
+                        is_active, hand_data = right_tuple if right_tuple else (False, {})
+                    
+                    if is_active and hand_data:
+                        sample = {}
+                        palm = self.get_joint_position(hand_data, 'Palm')
+                        
+                        for finger in self.INSPIRE_ORDER:
+                            tip = self.get_joint_position(hand_data, self.FINGER_TIPS[finger])
+                            if tip is not None and palm is not None:
+                                sample[finger] = np.linalg.norm(tip - palm)
+                        
+                        thumb_prox = self.get_joint_position(hand_data, 'ThumbProximal')
+                        if thumb_prox is not None and palm is not None:
+                            sample['thumb_rot'] = np.linalg.norm(thumb_prox - palm)
+                        
+                        if sample:
+                            samples.append(sample)
+                            if i % 10 == 0:
+                                print(".", end="", flush=True)
+                except Exception as e:
+                    pass
+                time.sleep(0.033)
+            
+            print()  # Newline after dots
+            if samples:
+                for key in samples[0].keys():
+                    vals = [s[key] for s in samples if key in s]
+                    if vals:
+                        calibration_data[side]['open'][key] = np.mean(vals)
+                print(f"   ✓ Open palm recorded ({len(samples)} samples)")
+            else:
+                print(f"   ⚠️  No {side} hand data - using defaults")
+        
+        # Apply calibration
+        print("\n" + "="*60)
+        print("📊 APPLYING CALIBRATION")
+        print("="*60)
+        
+        for finger in self.INSPIRE_ORDER:
+            min_vals = [calibration_data[s]['closed'].get(finger, 0) for s in ['left', 'right']]
+            max_vals = [calibration_data[s]['open'].get(finger, 0) for s in ['left', 'right']]
+            
+            if any(v > 0 for v in min_vals):
+                self.min_extension[finger] = np.mean([v for v in min_vals if v > 0])
+            if any(v > 0 for v in max_vals):
+                self.max_extension[finger] = np.mean([v for v in max_vals if v > 0])
+        
+        # Thumb rotation
+        rot_min = [calibration_data[s]['closed'].get('thumb_rot', 0) for s in ['left', 'right']]
+        rot_max = [calibration_data[s]['open'].get('thumb_rot', 0) for s in ['left', 'right']]
+        
+        if any(v > 0 for v in rot_min):
+            self.thumb_rot_min_dist = np.mean([v for v in rot_min if v > 0])
+        if any(v > 0 for v in rot_max):
+            self.thumb_rot_max_dist = np.mean([v for v in rot_max if v > 0])
+        
+        # Print summary
+        print("\nCalibrated ranges:")
+        print(f"{'Finger':<12} {'Min (cm)':<12} {'Max (cm)':<12}")
+        print("-" * 36)
+        for finger in self.INSPIRE_ORDER:
+            print(f"{finger:<12} {self.min_extension[finger]*100:>8.2f}     {self.max_extension[finger]*100:>8.2f}")
+        print(f"{'thumb_rot':<12} {self.thumb_rot_min_dist*100:>8.2f}     {self.thumb_rot_max_dist*100:>8.2f}")
+        
+        print("\n✅ Calibration complete!")
+        print("="*60 + "\n")
+    
+    def process_hand(self, hand_data, side):
+        """Process hand data into 6 DOF Inspire values"""
+        if not hand_data:
+            return None
+        
+        values = []
+        for finger in self.INSPIRE_ORDER:
+            val = self.calculate_inspire_value(hand_data, finger, side)
+            values.append(val)
+        
+        # Thumb bend (tip to proximal distance)
+        thumb_tip = self.get_joint_position(hand_data, 'ThumbTip')
+        thumb_prox = self.get_joint_position(hand_data, 'ThumbProximal')
+        if thumb_tip is not None and thumb_prox is not None:
+            dist = np.linalg.norm(thumb_tip - thumb_prox)
+            normalized = (0.04 - dist) / (0.04 - 0.015)
+            normalized = np.clip(normalized, 0.0, 1.0)
+            thumb_bend = int(normalized * self.INSPIRE_MAX)
+        else:
+            thumb_bend = 0
+        
+        thumb_rot = self.calculate_thumb_rotation(hand_data, side)
+        
+        # Replace thumb value with bend, add rotation
+        values[4] = thumb_bend  # ThumbBend
+        values.append(thumb_rot)  # ThumbRot (6th DOF)
+        
+        return values
+
+
+class ClapDetector:
+    """Detect clap gesture for safety pause"""
+    
+    def __init__(self):
+        self.CLAP_DISTANCE = 0.10  # 10cm
+        self.RELEASE_DISTANCE = 0.20  # 20cm
+        self.latched = False
+    
+    def check(self, left_hand_data, right_hand_data, gesture_processor):
+        """Returns True on clap rising edge only"""
+        if not left_hand_data or not right_hand_data:
+            return False
+        
+        # Handle tuple format: (is_active, hand_data_dict)
+        if isinstance(left_hand_data, tuple):
+            left_is_active, left_hand_data = left_hand_data
+            if not left_is_active:
+                return False
+        if isinstance(right_hand_data, tuple):
+            right_is_active, right_hand_data = right_hand_data
+            if not right_is_active:
+                return False
+        
+        left_palm = gesture_processor.get_joint_position(left_hand_data, 'Palm')
+        right_palm = gesture_processor.get_joint_position(right_hand_data, 'Palm')
+        
+        if left_palm is None or right_palm is None:
+            return False
+        
+        distance = np.linalg.norm(left_palm - right_palm)
+        
+        if self.latched:
+            if distance > self.RELEASE_DISTANCE:
+                self.latched = False
+            return False
+        else:
+            if distance < self.CLAP_DISTANCE:
+                self.latched = True
+                return True
+            return False
 
 def start_interpolation(state_machine, start_obs, end_obs, duration=1.0):
     """Start interpolation from start_obs to end_obs over given duration"""
@@ -399,7 +749,14 @@ class XRobotTeleopToRobot:
             expected_fps=self.target_fps,
             name="Teleop Loop"
         )
-
+        
+        # Inspire hands
+        self.inspire_hand_controller = None
+        self.use_inspire_hands = args.use_inspire_hands if hasattr(args, 'use_inspire_hands') else False
+        
+        # Hand tracking (Pico)
+        self.gesture_processor = HandGestureProcessor()
+        self.clap_detector = ClapDetector()
 
     def setup_teleop_data_streamer(self):
         """Initialize and start the teleop data streamer"""
@@ -448,6 +805,99 @@ class XRobotTeleopToRobot:
         """Setup rate limiter for consistent FPS"""
         self.rate = RateLimiter(frequency=self.target_fps, warn=False)
         print(f"Rate limiter setup for {self.target_fps} FPS")
+    
+    def setup_inspire_hands(self):
+        """Setup Inspire hands with direct Modbus TCP connection"""
+        if not self.use_inspire_hands:
+            return
+        
+        try:
+            left_ip = self.args.inspire_left_ip
+            right_ip = self.args.inspire_right_ip
+            
+            print(f"[INSPIRE] Connecting to Inspire hands: Left={left_ip}, Right={right_ip}")
+            
+            self.inspire_hand_controller = DualHandController(
+                left_ip=left_ip,
+                right_ip=right_ip,
+                timeout=3.0
+            )
+            
+            # Wait for connection to stabilize
+            time.sleep(0.5)
+            
+            # Test sequence: open → close → open
+            print("[INSPIRE] Running startup test sequence...")
+            print("[INSPIRE]   Opening hands...")
+            self.inspire_hand_controller.open_both()
+            time.sleep(1.0)
+            
+            print("[INSPIRE]   Closing hands...")
+            self.inspire_hand_controller.close_both()
+            time.sleep(1.0)
+            
+            print("[INSPIRE]   Opening hands again...")
+            self.inspire_hand_controller.open_both()
+            time.sleep(0.5)
+            
+            print("[INSPIRE] ✓ Inspire hands connected and tested")
+            print("[INSPIRE] ✓ Pico hand tracking enabled")
+            
+        except Exception as e:
+            print(f"[INSPIRE] ✗ Failed to connect: {e}")
+            print("[INSPIRE]   Make sure you can ping 192.168.123.210/211 from host")
+            self.inspire_hand_controller = None
+            self.use_inspire_hands = False
+    
+    def control_inspire_hands(self, left_hand_data, right_hand_data):
+        """Control Inspire hands using Pico hand tracking - direct Modbus connection"""
+        if not self.use_inspire_hands or self.inspire_hand_controller is None:
+            return
+        
+        try:
+            # Handle tuple format: (is_active, hand_data_dict)
+            left_is_active = False
+            right_is_active = False
+            left_hand_dict = {}
+            right_hand_dict = {}
+            
+            if isinstance(left_hand_data, tuple):
+                left_is_active, left_hand_dict = left_hand_data
+            elif left_hand_data:
+                left_is_active = True
+                left_hand_dict = left_hand_data
+                
+            if isinstance(right_hand_data, tuple):
+                right_is_active, right_hand_dict = right_hand_data
+            elif right_hand_data:
+                right_is_active = True
+                right_hand_dict = right_hand_data
+            
+            # Process hand tracking data into Inspire values (0-1000 for each DOF)
+            left_values = None
+            right_values = None
+            
+            if left_is_active and left_hand_dict:
+                left_values = self.gesture_processor.process_hand(left_hand_dict, 'left')
+            if right_is_active and right_hand_dict:
+                right_values = self.gesture_processor.process_hand(right_hand_dict, 'right')
+            
+            # Convert to raw angles (0-2000) and send directly to hands
+            # Our values: 0=open, 1000=closed
+            # Inspire raw: 0=closed, 2000=open (inverted)
+            if left_values:
+                left_inverted = [1000 - v for v in left_values]
+                left_raw = [int(v * 2) for v in left_inverted]
+                self.inspire_hand_controller.left_hand.set_angles(left_raw)
+            
+            if right_values:
+                right_inverted = [1000 - v for v in right_values]
+                right_raw = [int(v * 2) for v in right_inverted]
+                self.inspire_hand_controller.right_hand.set_angles(right_raw)
+            
+        except Exception as e:
+            # Don't spam errors - just silently retry next frame
+            pass
         
     def get_teleop_data(self):
         """Get current teleop data from streamer"""
@@ -668,6 +1118,14 @@ class XRobotTeleopToRobot:
         
     def handle_exit_sequence(self, viewer):
         """Handle graceful exit with interpolation to default pose"""
+        # Open Inspire hands on exit
+        if self.use_inspire_hands and self.inspire_hand_controller:
+            print("Opening Inspire hands...")
+            try:
+                self.inspire_hand_controller.open_both()
+            except:
+                pass
+        
         if self.state_machine.current_mimic_obs is not None:
             default_obs = DEFAULT_MIMIC_OBS[self.robot_name]
             current_obs = self.state_machine.current_mimic_obs[:35] if len(self.state_machine.current_mimic_obs) > 35 else self.state_machine.current_mimic_obs
@@ -695,6 +1153,7 @@ class XRobotTeleopToRobot:
         self.setup_mujoco_simulation()
         self.setup_video_recording()
         self.setup_rate_limiter()
+        self.setup_inspire_hands()
 
         print("Teleop state machine initialized. Controls:")
         print("- Right controller key_one: Cycle through idle -> teleop -> pause -> teleop...")
@@ -702,6 +1161,7 @@ class XRobotTeleopToRobot:
         print("- Left controller axis_click: Emergency stop - kills sim2real.sh process")
         print("- Left controller axis: Control root xy velocity")
         print("- Right controller axis: Control yaw velocity")
+        print("- Triggers: Control robot hand poses (sent to Redis)")
         print("- Publishes 35-dimensional mimic observations")
         print(f"Starting in state: {self.state_machine.get_current_state()}")
 
@@ -714,12 +1174,26 @@ class XRobotTeleopToRobot:
             print(f"- FPS measurement: ENABLED (detailed stats every {self.fps_monitor.detailed_print_interval} steps)")
         else:
             print(f"- FPS measurement: Quick stats only (every {self.fps_monitor.quick_print_interval} steps)")
+        
+        if self.use_inspire_hands:
+            print("- Inspire hands: ENABLED (Pico hand tracking)")
+        else:
+            print("- Inspire hands: DISABLED")
 
         print("Ready to receive teleop data.")
 
     def run(self):
         """Main execution loop"""
         self.initialize_all_systems()
+        
+        # Hand calibration step (if hands enabled and not skipped)
+        if self.use_inspire_hands and not getattr(self.args, 'skip_calibration', False):
+            print("\n" + "="*60)
+            print("STEP 1: HAND CALIBRATION")
+            print("="*60)
+            self.gesture_processor.calibrate(self.teleop_data_streamer)
+            print("\nSTEP 2: LAUNCHING VISUALIZATION")
+            print("="*60 + "\n")
         
         # Start the viewer
         with mjv.launch_passive(
@@ -738,6 +1212,24 @@ class XRobotTeleopToRobot:
                 if controller_data is not None:
                     self.state_machine.update(controller_data)
                     self.send_controller_data_to_redis(controller_data)
+                
+                # Check for clap (safety pause/resume) - toggles same as A button
+                if self.clap_detector.check(left_hand_data, right_hand_data, self.gesture_processor):
+                    current_state = self.state_machine.state
+                    if current_state == "teleop":
+                        self.state_machine.state = "pause"
+                        print("👏 CLAP - PAUSED (body + hands frozen)")
+                    elif current_state == "pause":
+                        self.state_machine.state = "teleop"
+                        print("👏 CLAP - RESUMED")
+                    elif current_state == "idle":
+                        # From idle, clap starts teleop
+                        self.state_machine.state = "teleop"
+                        print("👏 CLAP - STARTING TELEOP")
+                
+                # Control Inspire hands with Pico tracking (skip if paused)
+                if self.state_machine.state == "teleop":
+                    self.control_inspire_hands(left_hand_data, right_hand_data)
                 
                 # Check if we should exit
                 if self.state_machine.should_exit():
@@ -832,6 +1324,28 @@ def parse_arguments():
         type=int,
         default=0,
         help="Measure and print detailed FPS statistics (0=disabled, 1=enabled).",
+    )
+    parser.add_argument(
+        "--use_inspire_hands",
+        action="store_true",
+        help="Enable Inspire hand control via Pico hand tracking.",
+    )
+    parser.add_argument(
+        "--inspire_left_ip",
+        type=str,
+        default="192.168.123.210",
+        help="IP address for left Inspire hand.",
+    )
+    parser.add_argument(
+        "--inspire_right_ip",
+        type=str,
+        default="192.168.123.211",
+        help="IP address for right Inspire hand.",
+    )
+    parser.add_argument(
+        "--skip_calibration", "-s",
+        action="store_true",
+        help="Skip hand calibration (use default values).",
     )
     return parser.parse_args()
 
