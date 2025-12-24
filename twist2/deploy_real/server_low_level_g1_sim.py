@@ -5,6 +5,7 @@ import numpy as np
 import redis
 import mujoco
 import torch
+import yaml
 from rich import print
 from collections import deque
 import mujoco.viewer as mjv
@@ -38,6 +39,121 @@ class OnnxPolicyWrapper:
         return torch.from_numpy(result.astype(np.float32))
 
 
+def get_gravity_orientation_from_quat(quaternion):
+    """Get gravity orientation from IMU quaternion (w, x, y, z order)"""
+    qw = quaternion[0]
+    qx = quaternion[1]
+    qy = quaternion[2]
+    qz = quaternion[3]
+
+    gravity_orientation = np.zeros(3)
+    gravity_orientation[0] = 2 * (-qz * qx + qw * qy)
+    gravity_orientation[1] = -2 * (qz * qy + qw * qx)
+    gravity_orientation[2] = 1 - 2 * (qw * qw + qz * qz)
+
+    return gravity_orientation
+
+
+class LocoModePolicy:
+    """RoboMimic LocoMode policy for leg locomotion (same as server_low_level_g1_real.py)"""
+    
+    def __init__(self, policy_dir="/workspace/RoboMimic_Deploy/policy/loco_mode"):
+        config_path = os.path.join(policy_dir, "config", "LocoMode.yaml")
+        
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"LocoMode config not found: {config_path}")
+        
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        self.policy_path = os.path.join(policy_dir, "model", config["policy_path"])
+        self.default_angles = np.array(config["default_angles"], dtype=np.float32)
+        self.joint2motor_idx = np.array(config["joint2motor_idx"], dtype=np.int32)
+        self.num_actions = config["num_actions"]
+        self.num_obs = config["num_obs"]
+        self.ang_vel_scale = config["ang_vel_scale"]
+        self.dof_pos_scale = config["dof_pos_scale"]
+        self.dof_vel_scale = config["dof_vel_scale"]
+        self.action_scale = config["action_scale"]
+        self.cmd_scale = np.array(config["cmd_scale"], dtype=np.float32)
+        
+        # Load PD gains from config
+        self.kps = np.array(config["kps"], dtype=np.float32)
+        self.kds = np.array(config["kds"], dtype=np.float32)
+        
+        # Reorder kps/kds to match motor indices
+        self.kps_reorder = np.zeros(29, dtype=np.float32)
+        self.kds_reorder = np.zeros(29, dtype=np.float32)
+        for i in range(len(self.joint2motor_idx)):
+            motor_idx = self.joint2motor_idx[i]
+            self.kps_reorder[motor_idx] = self.kps[i]
+            self.kds_reorder[motor_idx] = self.kds[i]
+        
+        cmd_range = config["cmd_range"]
+        self.range_velx = cmd_range["lin_vel_x"]
+        self.range_vely = cmd_range["lin_vel_y"]
+        self.range_velz = cmd_range["ang_vel_z"]
+        
+        # Load policy
+        self.policy = torch.jit.load(self.policy_path)
+        self.policy.eval()
+        
+        # Initialize buffers
+        self.obs = np.zeros(self.num_obs, dtype=np.float32)
+        self.action = np.zeros(self.num_actions, dtype=np.float32)
+        self.qj_obs = np.zeros(self.num_actions, dtype=np.float32)
+        self.dqj_obs = np.zeros(self.num_actions, dtype=np.float32)
+        
+        print(f"[LocoMode] Policy loaded from {self.policy_path}")
+    
+    def compute(self, qj, dqj, ang_vel, gravity_ori, vel_cmd):
+        """Compute leg joint positions from velocity command"""
+        # Scale velocity command EXACTLY like RoboMimic does
+        vel_cmd_clipped = np.clip(vel_cmd, -1.0, 1.0)
+        
+        # Use RoboMimic's exact scaling formula
+        vx_scaled = (vel_cmd_clipped[0] + 1) * (self.range_velx[1] - self.range_velx[0]) / 2 + self.range_velx[0]
+        vy_scaled = (vel_cmd_clipped[1] + 1) * (self.range_vely[1] - self.range_vely[0]) / 2 + self.range_vely[0]
+        vyaw_scaled = (vel_cmd_clipped[2] + 1) * (self.range_velz[1] - self.range_velz[0]) / 2 + self.range_velz[0]
+        
+        cmd = np.array([vx_scaled, vy_scaled, vyaw_scaled], dtype=np.float32) * self.cmd_scale
+        
+        # Reorder joints for policy
+        for i in range(len(self.joint2motor_idx)):
+            self.qj_obs[i] = qj[self.joint2motor_idx[i]]
+            self.dqj_obs[i] = dqj[self.joint2motor_idx[i]]
+        
+        # Scale observations
+        qj_scaled = (self.qj_obs - self.default_angles) * self.dof_pos_scale
+        dqj_scaled = self.dqj_obs * self.dof_vel_scale
+        ang_vel_scaled = ang_vel * self.ang_vel_scale
+        
+        # Build observation vector
+        self.obs[:3] = ang_vel_scaled
+        self.obs[3:6] = gravity_ori
+        self.obs[6:9] = cmd
+        self.obs[9:9 + self.num_actions] = qj_scaled
+        self.obs[9 + self.num_actions:9 + self.num_actions * 2] = dqj_scaled
+        self.obs[9 + self.num_actions * 2:9 + self.num_actions * 3] = self.action
+        
+        # Run policy
+        with torch.inference_mode():
+            obs_tensor = self.obs.reshape(1, -1).astype(np.float32)
+            self.action = self.policy(torch.from_numpy(obs_tensor).clip(-100, 100)).clip(-100, 100).detach().numpy().squeeze()
+        
+        # Convert to joint positions
+        loco_action = self.action * self.action_scale + self.default_angles
+        
+        # Reorder for motor indices - return full 29 joints
+        action_reorder = np.zeros(29, dtype=np.float32)
+        for i in range(len(self.joint2motor_idx)):
+            motor_idx = self.joint2motor_idx[i]
+            action_reorder[motor_idx] = loco_action[i]
+        
+        # Return action + PD gains
+        return action_reorder, self.kps_reorder.copy(), self.kds_reorder.copy()
+
+
 def load_onnx_policy(policy_path: str, device: str) -> OnnxPolicyWrapper:
     if ort is None:
         raise ImportError("onnxruntime is required for ONNX policy inference but is not installed.")
@@ -65,6 +181,7 @@ class RealTimePolicyController:
                  measure_fps=False,
                  limit_fps=True,
                  policy_frequency=50,
+                 hybrid_loco_mode=False,
                  ):
         self.measure_fps = measure_fps
         self.limit_fps = limit_fps
@@ -76,6 +193,19 @@ class RealTimePolicyController:
             print(f"Error connecting to Redis: {e}")
 
         self.device = device
+        self.hybrid_loco_mode = hybrid_loco_mode
+        self.loco_policy = None
+        
+        if hybrid_loco_mode:
+            print("[HYBRID] TEST MODE: Full RoboMimic control (all 29 joints) when walking")
+            try:
+                self.loco_policy = LocoModePolicy()
+                print("[HYBRID] LocoMode policy loaded successfully")
+            except Exception as e:
+                print(f"[HYBRID] Failed to load LocoMode policy: {e}")
+                print("[HYBRID] Continuing without hybrid mode...")
+                self.hybrid_loco_mode = False
+        
         self.policy = load_onnx_policy(policy_path, device)
 
         # Create MuJoCo sim
@@ -240,6 +370,21 @@ class RealTimePolicyController:
                 t_start = time.time()
                 dof_pos, dof_vel, quat, ang_vel, sim_torque = self.extract_data()
                 
+                # Read velocity command from Redis every step (for hybrid mode)
+                # Cache it so we can use it in the policy frequency block
+                if self.hybrid_loco_mode and self.loco_policy is not None:
+                    if not hasattr(self, '_last_vel_cmd_time') or (time.time() - self._last_vel_cmd_time) > 0.01:
+                        # Read from Redis every 10ms (100 Hz) to avoid too many Redis calls
+                        vel_cmd_str = self.redis_client.get("loco_vel_cmd")
+                        if vel_cmd_str:
+                            self._cached_vel_cmd = np.array(json.loads(vel_cmd_str), dtype=np.float32)
+                        else:
+                            self._cached_vel_cmd = np.zeros(3, dtype=np.float32)
+                        self._last_vel_cmd_time = time.time()
+                    vel_cmd = self._cached_vel_cmd
+                else:
+                    vel_cmd = None
+                
                 if i % self.sim_decimation == 0:
                     # Build proprioceptive observation
                     rpy = quatToEuler(quat)
@@ -338,6 +483,47 @@ class RealTimePolicyController:
                     raw_action = np.clip(raw_action, -10., 10.)
                     scaled_actions = raw_action * self.action_scale
                     pd_target = scaled_actions + self.default_dof_pos
+                    
+                    # HYBRID MODE: Use LocoMode for legs when velocity command received
+                    if self.hybrid_loco_mode and self.loco_policy is not None and vel_cmd is not None:
+                        # Check if velocity command is significant (above threshold)
+                        vel_magnitude = np.linalg.norm(vel_cmd)
+                        vel_threshold = 0.05  # Only use LocoMode if joystick is moved significantly
+                        
+                        if vel_magnitude > vel_threshold:
+                            # Debug: print velocity command
+                            if not hasattr(self, '_last_vel_print') or (time.time() - self._last_vel_print) > 0.5:
+                                print(f"[DEBUG] Using vel_cmd: {vel_cmd} (magnitude: {vel_magnitude:.3f})")
+                                self._last_vel_print = time.time()
+                            
+                            # Get gravity orientation from quaternion
+                            gravity_ori = get_gravity_orientation_from_quat(quat)
+                            
+                            # Always compute LocoMode (exactly like RoboMimic)
+                            loco_action, loco_kps, loco_kds = self.loco_policy.compute(
+                                dof_pos,     # Current joint positions
+                                dof_vel,     # Current joint velocities  
+                                ang_vel,     # Angular velocity
+                                gravity_ori, # Gravity orientation
+                                vel_cmd      # Velocity command
+                            )
+                            
+                            # PURE ROBOMIMIC: Use LocoMode legs + default upper body
+                            pd_target = loco_action.copy()
+                            pd_target[12:] = self.default_dof_pos[12:]  # Upper body from default pose
+                            
+                            # Store LocoMode PD gains for use in torque computation
+                            # We'll use these instead of default stiffness/damping for legs
+                            self.loco_kps = loco_kps.copy()
+                            self.loco_kds = loco_kds.copy()
+                            # Use default gains for upper body
+                            for i in range(12, 29):
+                                self.loco_kps[i] = self.stiffness[i]
+                                self.loco_kds[i] = self.damping[i]
+                        else:
+                            # Velocity too small - use TWIST2 policy instead (prevents stepping when joystick centered)
+                            # This prevents the zero-velocity → middle-velocity mapping issue
+                            pass
 
                     # self.redis_client.set("action_low_level_unitree_g1", json.dumps(raw_action.tolist()))
                     
@@ -364,7 +550,15 @@ class RealTimePolicyController:
 
                
                 # PD control
-                torque = (pd_target - dof_pos) * self.stiffness - dof_vel * self.damping
+                # Use LocoMode PD gains if in hybrid mode, otherwise use default
+                if self.hybrid_loco_mode and self.loco_policy is not None and hasattr(self, 'loco_kps'):
+                    kps = self.loco_kps
+                    kds = self.loco_kds
+                else:
+                    kps = self.stiffness
+                    kds = self.damping
+                
+                torque = (pd_target - dof_pos) * kps - dof_vel * kds
                 torque = np.clip(torque, -self.torque_limits, self.torque_limits)
                 
                 self.data.ctrl[:] = torque
@@ -414,6 +608,8 @@ def main():
     parser.add_argument("--measure_fps", help="Measure FPS", default=0, type=int)
     parser.add_argument("--limit_fps", help="Limit FPS with sleep", default=1, type=int)
     parser.add_argument("--policy_frequency", help="Policy frequency", default=100, type=int)
+    parser.add_argument('--hybrid_loco_mode', action='store_true',
+                        help='TEST MODE: Use full RoboMimic LocoMode output (all 29 joints) when walking to test structure.')
     args = parser.parse_args()
     
     # Verify policy file exists
@@ -443,6 +639,7 @@ def main():
         measure_fps=args.measure_fps,
         limit_fps=args.limit_fps,
         policy_frequency=args.policy_frequency,
+        hybrid_loco_mode=args.hybrid_loco_mode,
     )
     controller.run()
 

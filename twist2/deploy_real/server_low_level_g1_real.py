@@ -417,40 +417,56 @@ class RealTimePolicyController(object):
                     else:
                         vel_cmd = np.zeros(3, dtype=np.float32)
                     
-                    # TEST MODE: PURE RoboMimic - ALWAYS use LocoMode (exactly like RoboMimic does)
-                    # RoboMimic always calls LocoMode.run() regardless of velocity
-                    # Get gravity orientation from IMU quaternion
-                    gravity_ori = get_gravity_orientation_from_quat(quat)
+                    # Check if velocity command is significant (above threshold)
+                    vel_magnitude = np.linalg.norm(vel_cmd)
+                    vel_threshold = 0.05  # Only use LocoMode if joystick is moved significantly
                     
-                    # Always compute LocoMode (exactly like RoboMimic)
-                    loco_action, loco_kps, loco_kds = self.loco_policy.compute(
-                        dof_pos,     # Real robot joint positions
-                        dof_vel,     # Real robot joint velocities  
-                        ang_vel,     # Real robot angular velocity
-                        gravity_ori, # Gravity orientation from IMU
-                        vel_cmd      # Velocity command (can be zero - policy handles it)
-                    )
-                    
-                    # PURE ROBOMIMIC: Use LocoMode legs + default upper body
-                    # LocoMode only outputs legs (0-11), rest are zeros
-                    target_dof_pos = loco_action.copy()
-                    target_dof_pos[12:] = self.default_dof_pos[12:]  # Upper body from default pose
-                    
-                    # Use RoboMimic's PD gains for legs, config gains for upper body
-                    final_kps = loco_kps.copy()
-                    final_kds = loco_kds.copy()
-                    for i in range(12, 29):
-                        final_kps[i] = self.config.kps[i]
-                        final_kds[i] = self.config.kds[i]
-                    
-                    # Send with RoboMimic's PD gains
-                    cmd = self.env.robot.create_zero_command()
-                    cmd.q_target = target_dof_pos.copy()
-                    cmd.dq_target = np.zeros_like(target_dof_pos)
-                    cmd.kp = final_kps.tolist()
-                    cmd.kd = final_kds.tolist()
-                    cmd.tau_ff = np.zeros_like(target_dof_pos)
-                    self.env.send_cmd(cmd)
+                    if vel_magnitude > vel_threshold:
+                        # Debug: print velocity command
+                        if not hasattr(self, '_last_vel_print') or (time.time() - self._last_vel_print) > 0.5:
+                            print(f"[DEBUG] Using vel_cmd: {vel_cmd} (magnitude: {vel_magnitude:.3f})")
+                            self._last_vel_print = time.time()
+                        
+                        # TEST MODE: PURE RoboMimic - Use LocoMode when velocity is significant
+                        # Get gravity orientation from IMU quaternion
+                        gravity_ori = get_gravity_orientation_from_quat(quat)
+                        
+                        # Compute LocoMode (exactly like RoboMimic)
+                        loco_action, loco_kps, loco_kds = self.loco_policy.compute(
+                            dof_pos,     # Real robot joint positions
+                            dof_vel,     # Real robot joint velocities  
+                            ang_vel,     # Real robot angular velocity
+                            gravity_ori, # Gravity orientation from IMU
+                            vel_cmd      # Velocity command
+                        )
+                        
+                        # PURE ROBOMIMIC: Use LocoMode legs + default upper body
+                        # LocoMode only outputs legs (0-11), rest are zeros
+                        target_dof_pos = loco_action.copy()
+                        target_dof_pos[12:] = self.default_dof_pos[12:]  # Upper body from default pose
+                        
+                        # Use RoboMimic's PD gains for legs, config gains for upper body
+                        final_kps = loco_kps.copy()
+                        final_kds = loco_kds.copy()
+                        for i in range(12, 29):
+                            final_kps[i] = self.config.kps[i]
+                            final_kds[i] = self.config.kds[i]
+                        
+                        # Send with RoboMimic's PD gains
+                        cmd = self.env.robot.create_zero_command()
+                        cmd.q_target = target_dof_pos.copy()
+                        cmd.dq_target = np.zeros_like(target_dof_pos)
+                        cmd.kp = final_kps.tolist()
+                        cmd.kd = final_kds.tolist()
+                        cmd.tau_ff = np.zeros_like(target_dof_pos)
+                        self.env.send_cmd(cmd)
+                    else:
+                        # Velocity too small - use TWIST2 policy instead (prevents stepping when joystick centered)
+                        # This prevents the zero-velocity → middle-velocity mapping issue
+                        # Fall through to use TWIST2 policy (same as non-hybrid mode)
+                        kp_scale = 1.0
+                        kd_scale = 1.0
+                        self.env.send_robot_action(target_dof_pos, kp_scale, kd_scale)
                 else:
                     # Non-hybrid mode: use TWIST2 with default gains
                     kp_scale = 1.0

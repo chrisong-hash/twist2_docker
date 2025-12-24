@@ -1,0 +1,16 @@
+# Cursor AI Assistant Rules
+
+## File Generation
+- NEVER create or generate files wihtout first confirming with the user
+- The flow for file generation should be to tell the user the purpose of the file and ask for permission
+- Favour telling the user over generating .md
+- Favour telling the commands and step over generating .sh
+
+## File Preservation
+- Favour preserving old working files and creating separate files/directories instead of modifying existing ones
+- When making significant changes, create new files with descriptive names (e.g., `_v2`, `_new`, or version numbers) rather than overwriting working code
+- Consider creating backup copies or separate directories for experimental changes
+
+
+## Starting Conversation
+- Before generating anything, chat with the user to confirm the direction before proceeding

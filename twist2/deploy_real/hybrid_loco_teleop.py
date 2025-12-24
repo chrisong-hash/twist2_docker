@@ -346,8 +346,18 @@ class HybridLocoTeleop:
     def _setup_teleop_streamer(self):
         """Initialize Pico VR connection via XRobotStreamer"""
         print("\n[2/5] Connecting to Pico VR...")
-        self.teleop_streamer = XRobotStreamer()
-        print("[green]XRobotStreamer initialized - waiting for Pico data[/green]")
+        try:
+            self.teleop_streamer = XRobotStreamer()
+            print("[green]XRobotStreamer initialized - waiting for Pico data[/green]")
+        except Exception as e:
+            print(f"[red]ERROR: Failed to initialize XRobotStreamer: {e}[/red]")
+            print("[yellow]Make sure:")
+            print("  1. XRobotToolkit app is running on Pico")
+            print("  2. Pico is connected to this PC via the app")
+            print("  3. xrobotoolkit_sdk is installed: pip install xrobotoolkit-sdk[/yellow]")
+            import traceback
+            traceback.print_exc()
+            self.teleop_streamer = None
     
     def _setup_retargeting(self, height=None):
         """Initialize GMR for upper body retargeting with given height"""
@@ -416,7 +426,11 @@ class HybridLocoTeleop:
     def get_teleop_data(self):
         """Get data from Pico VR"""
         if self.teleop_streamer is not None:
-            return self.teleop_streamer.get_current_frame()
+            try:
+                return self.teleop_streamer.get_current_frame()
+            except Exception as e:
+                # Silently handle errors - Pico might disconnect temporarily
+                return None, None, None, None, None
         return None, None, None, None, None
     
     def update_state(self, controller_data):
@@ -461,22 +475,32 @@ class HybridLocoTeleop:
         left_axis = left_ctrl.get("axis", [0, 0])
         right_axis = right_ctrl.get("axis", [0, 0])
         
-        # Left joystick for movement
-        self.vel_cmd[0] = left_axis[1]   # forward/backward
-        self.vel_cmd[1] = -left_axis[0]  # strafe
-        # Right joystick for rotation
-        self.vel_cmd[2] = -right_axis[0]  # yaw
+        # Debug: print raw joystick values occasionally
+        if not hasattr(self, '_last_joystick_debug') or (time.time() - self._last_joystick_debug) > 1.0:
+            print(f"[DEBUG] Raw joystick - left_axis: {left_axis}, right_axis: {right_axis}")
+            self._last_joystick_debug = time.time()
         
-        # Apply deadzone
-        for i in range(3):
-            if abs(self.vel_cmd[i]) < 0.1:
-                self.vel_cmd[i] = 0.0
+        # Left joystick for movement
+        self.vel_cmd[0] = left_axis[1] if len(left_axis) > 1 else 0.0   # forward/backward
+        self.vel_cmd[1] = -left_axis[0] if len(left_axis) > 0 else 0.0  # strafe
+        # Right joystick for rotation
+        self.vel_cmd[2] = -right_axis[0] if len(right_axis) > 0 else 0.0  # yaw
+        
+        # NO deadzone applied - let RoboMimic policy handle small inputs
+        # RoboMimic's scale_values maps 0 → middle of velocity range, not 0 → 0
+        # Applying deadzone here would cause drift when joystick is centered
+        # The policy was trained to handle small inputs naturally
         
         # Right trigger enables locomotion
         trigger_right = right_ctrl.get("index_trig", 0.0)
         if isinstance(trigger_right, bool):
             trigger_right = 1.0 if trigger_right else 0.0
         self.locomotion_enabled = trigger_right > 0.5
+        
+        # Debug: print when trigger state changes
+        if not hasattr(self, '_last_trigger_state') or self._last_trigger_state != self.locomotion_enabled:
+            print(f"[DEBUG] Locomotion enabled: {self.locomotion_enabled} (trigger: {trigger_right})")
+            self._last_trigger_state = self.locomotion_enabled
     
     def _validate_quaternions(self, smplx_data):
         """Check if smplx_data contains valid quaternions (non-zero norm)"""
@@ -554,6 +578,27 @@ class HybridLocoTeleop:
         
         return qpos
     
+    def _send_velocity_command_only(self):
+        """Send only velocity command to Redis (called every loop iteration in teleop mode)"""
+        if self.locomotion_enabled:
+            # Send current velocity command when locomotion is enabled
+            vel_cmd_to_send = self.vel_cmd.copy()
+            self.redis_client.set(
+                "loco_vel_cmd",
+                json.dumps(vel_cmd_to_send.tolist())
+            )
+            # Debug: print when sending non-zero values
+            if np.any(np.abs(vel_cmd_to_send) > 0.01):
+                if not hasattr(self, '_last_vel_send_print') or (time.time() - self._last_vel_send_print) > 0.5:
+                    print(f"\n[DEBUG] Sending vel_cmd to Redis: {vel_cmd_to_send} (locomotion_enabled={self.locomotion_enabled})")
+                    self._last_vel_send_print = time.time()
+        else:
+            # Zero velocity when not walking
+            self.redis_client.set(
+                "loco_vel_cmd",
+                json.dumps([0.0, 0.0, 0.0])
+            )
+    
     def send_to_redis(self, mimic_obs, neck_data=None):
         """Send observations to Redis for sim2real"""
         if mimic_obs is not None:
@@ -568,14 +613,13 @@ class HybridLocoTeleop:
                 json.dumps(neck_data)
             )
         
-        # Send velocity command for LocoMode (only when trigger held)
+        # Also send velocity command (in case it wasn't sent in _send_velocity_command_only)
         if self.locomotion_enabled:
             self.redis_pipeline.set(
                 "loco_vel_cmd",
                 json.dumps(self.vel_cmd.tolist())
             )
         else:
-            # Zero velocity when not walking
             self.redis_pipeline.set(
                 "loco_vel_cmd",
                 json.dumps([0.0, 0.0, 0.0])
@@ -607,10 +651,12 @@ class HybridLocoTeleop:
         
         loco = "W" if self.locomotion_enabled else "-"
         fb = "F" if getattr(self, '_using_fallback', False) else "-"
-        # Compact: [state] P:- C:- L:(+0.0,+0.0) R:+0.0 T:0 W:- F:- v:(+0.0,+0.0,+0.0)
+        # Show if velocity will be sent (teleop mode + locomotion enabled)
+        sending = "SEND" if (self.state == "teleop" and self.locomotion_enabled) else "----"
+        # Compact: [state] P:- C:- L:(+0.0,+0.0) R:+0.0 T:0 W:- F:- v:(+0.0,+0.0,+0.0) SEND
         status = (f"[{self.state:7s}] {p}{c}{fb} "
                   f"L:({lx:+.1f},{ly:+.1f}) R:{rx:+.1f} T:{trig:.0f} {loco} "
-                  f"v:({self.vel_cmd[0]:+.1f},{self.vel_cmd[1]:+.1f},{self.vel_cmd[2]:+.1f})")
+                  f"v:({self.vel_cmd[0]:+.1f},{self.vel_cmd[1]:+.1f},{self.vel_cmd[2]:+.1f}) {sending}")
         
         # Print with carriage return - keep under 80 chars
         sys.stdout.write(f"\r{status:<79}")
@@ -639,15 +685,42 @@ class HybridLocoTeleop:
             # Match original teleop settings
             viewer.opt.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = 1
             
+            # Track connection status
+            no_data_warnings = 0
+            last_warning_time = 0
+            
             while viewer.is_running() and self.state != "exit":
                 # Get Pico data
                 smplx_data, left_hand, right_hand, controller, headset = self.get_teleop_data()
                 
-                # Update state machine
+                # Warn if no data received and teleop_streamer exists
+                if self.teleop_streamer is not None:
+                    if smplx_data is None and controller is None:
+                        no_data_warnings += 1
+                        current_time = time.time()
+                        # Warn every 5 seconds
+                        if current_time - last_warning_time > 5.0:
+                            print(f"\n[yellow]Warning: No Pico data received ({no_data_warnings} attempts)[/yellow]")
+                            print("[yellow]Make sure:")
+                            print("  1. XRobotToolkit app is running on Pico")
+                            print("  2. Pico is connected to this PC")
+                            print("  3. Check app connection status[/yellow]")
+                            last_warning_time = current_time
+                    else:
+                        no_data_warnings = 0  # Reset counter when data arrives
+                
+                # Update state machine (this updates vel_cmd and locomotion_enabled)
                 self.update_state(controller)
                 
                 # Print live status (replacing line)
                 self._print_status(controller, smplx_data)
+                
+                # ALWAYS send velocity commands if in teleop mode (regardless of smplx_data)
+                # This ensures joystick control works even without body tracking
+                if self.state == "teleop":
+                    # Send velocity commands immediately after updating state
+                    # This ensures they're sent every loop iteration
+                    self._send_velocity_command_only()
                 
                 # Auto-transition from idle to preview when data arrives
                 if self.state == "idle" and smplx_data is not None:
@@ -688,6 +761,11 @@ class HybridLocoTeleop:
                     # Send to Redis if in teleop mode
                     if self.state == "teleop":
                         self.send_to_redis(mimic_obs, neck_data)
+                else:
+                    # Even if no smplx_data, send velocity commands if in teleop mode
+                    # This ensures joystick control works even without body tracking
+                    if self.state == "teleop":
+                        self.send_to_redis(None, None)  # Send only velocity commands
                 
                 viewer.sync()
                 rate.sleep()
