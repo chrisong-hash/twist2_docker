@@ -1,16 +1,27 @@
 #!/bin/bash
-# Hybrid Locomotion + Teleoperation
-# ==================================
-# Same workflow as teleop_inspire.sh but with joystick walking!
+# Hybrid Locomotion + Teleoperation v2
+# =====================================
+# Full body teleop with optional joystick walking mode.
+#
+# States:
+#   idle        : Waiting for Pico VR data
+#   preview     : MuJoCo preview (calibrate here)
+#   teleop_full : Full body teleop (default) - TWIST2 controls all joints
+#   teleop_loco : Locomotion mode - legs walk via joystick, upper body tracks
+#   paused      : Robot at default standing pose
 #
 # Workflow:
 # 1. Start XRobotToolkit app on Pico
 # 2. Connect Pico to this PC via the app
 # 3. Run this script
 # 4. MuJoCo preview shows your motion - calibrate until tracking works
-# 5. Press Right A button to enter teleop mode
-# 6. HOLD Right Trigger + use joystick to walk
-# 7. Then run sim2real.sh in another terminal to enable robot
+# 5. Press Right A → enters teleop_full (full body teleop)
+# 6. Press Right Grip → switches to teleop_loco (walking mode)
+# 7. Use joysticks to walk in teleop_loco
+# 8. Press Right Grip again → back to teleop_full
+# 9. Press Left A anytime → pause/unpause
+#
+# All transitions have smooth 1-second interpolation!
 
 # Make sure Redis is running
 redis-cli ping > /dev/null 2>&1
@@ -28,36 +39,44 @@ eval "$(conda shell.bash hook)"
 conda activate gmr
 
 # Configuration
-actual_human_height=${HUMAN_HEIGHT:-1.65}
+actual_human_height=1.80
 redis_ip="localhost"
 target_fps=50
 
 echo ""
 echo "============================================================"
-echo "  HYBRID LOCOMOTION + TELEOPERATION"
+echo "  HYBRID LOCOMOTION + TELEOPERATION v2"
 echo "============================================================"
 echo ""
-echo "This script follows the same workflow as teleop_inspire.sh"
-echo "but adds joystick-based walking via RoboMimic LocoMode!"
+echo "Full body teleop with optional joystick walking mode."
+echo "All mode transitions have smooth 1-second interpolation!"
 echo ""
 echo "Prerequisites:"
 echo "  1. XRobotToolkit app running on Pico"
 echo "  2. Pico connected to this PC"
-echo "  3. RoboMimic_Deploy cloned at /home/robo/CodeSpace/RoboMimic_Deploy"
+echo "  3. RoboMimic_Deploy mounted at /workspace/RoboMimic_Deploy"
 echo ""
 echo "Controls:"
-echo "  Right A button  : Toggle preview/teleop mode"
-echo "  Left A button   : Exit"
-echo "  Left joystick   : Walk (forward/back/strafe)"
-echo "  Right joystick  : Rotate"
-echo "  Right trigger   : HOLD to enable leg locomotion"
+echo "  Right A (key_one)  : Toggle preview ↔ teleop"
+echo "  Right Grip         : Toggle teleop_full ↔ teleop_loco"
+echo "  Left A (key_one)   : Toggle pause"
+echo "  B button (key_two) : EMERGENCY SHUTDOWN (stops teleop + robot server)"
+echo "  Left joystick      : Walk (only in teleop_loco)"
+echo "  Right joystick     : Rotate (only in teleop_loco)"
+echo ""
+echo "States:"
+echo "  teleop_full : Full body teleop (default)"
+echo "  teleop_loco : Walking mode (joystick controls legs)"
+echo "  paused      : Robot at standing pose"
 echo ""
 echo "Workflow:"
-echo "  1. Move until MuJoCo reflects your motion (calibration)"
-echo "  2. Press Right A → enters teleop mode"
-echo "  3. In another terminal run the HYBRID sim2real:"
-echo "     cd /workspace/twist2 && bash sim2real_hybrid.sh"
-echo "  4. HOLD Right Trigger + joystick to walk!"
+echo "  1. Calibrate until MuJoCo reflects your motion"
+echo "  2. Press Right A → enters teleop_full"
+echo "  3. In another terminal: cd /workspace/twist2 && bash sim2real_hybrid.sh"
+echo "  4. Press Right Grip → teleop_loco (walking mode)"
+echo "  5. Use joysticks to walk"
+echo "  6. Press Right Grip → back to teleop_full"
+echo "  7. Press Left A → pause/unpause"
 echo "============================================================"
 echo ""
 
@@ -78,7 +97,8 @@ python hybrid_loco_teleop.py \
     --robot unitree_g1 \
     --actual_human_height $actual_human_height \
     --redis_ip $redis_ip \
-    --target_fps $target_fps
+    --target_fps $target_fps \
+    --smooth --smooth_window_size 4
 
 echo ""
 echo "Hybrid teleop stopped."

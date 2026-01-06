@@ -88,7 +88,23 @@ class LocoModePolicy:
         self.qj_obs = np.zeros(self.num_actions, dtype=np.float32)
         self.dqj_obs = np.zeros(self.num_actions, dtype=np.float32)
         
+        # Track if policy needs reset on mode switch
+        self._needs_reset = True
+        
+        # Reorder default angles for motor indices (for upper body default pose)
+        self.default_angles_reorder = np.zeros(29, dtype=np.float32)
+        for i in range(len(self.joint2motor_idx)):
+            motor_idx = self.joint2motor_idx[i]
+            self.default_angles_reorder[motor_idx] = self.default_angles[i]
+        
         print(f"[LocoMode] Policy loaded from {self.policy_path}")
+    
+    def reset(self):
+        """Reset action buffer - call when switching to LocoMode to avoid stale history"""
+        self.action = np.zeros(self.num_actions, dtype=np.float32)
+        self.obs = np.zeros(self.num_obs, dtype=np.float32)
+        self._needs_reset = False
+        print("[LocoMode] Action buffer reset for clean mode switch")
     
     def compute(self, qj, dqj, ang_vel, gravity_ori, vel_cmd):
         """Compute leg joint positions from velocity command and real robot state
@@ -242,6 +258,9 @@ class RealTimePolicyController(object):
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
             self.redis_pipeline = self.redis_client.pipeline()
+            # Clear any previous shutdown signal on startup
+            self.redis_client.delete("robot_shutdown")
+            print("[SAFETY] Shutdown signal cleared - ready for operation")
         except Exception as e:
             print(f"Error connecting to Redis: {e}")
             exit()
@@ -313,10 +332,23 @@ class RealTimePolicyController(object):
     def run(self):
         self.reset_robot()
         print("Begin main TWIST2 policy loop. Press [Select] on remote to exit.")
-
+        print("[SAFETY] Press B button on Pico controller for emergency shutdown.")
+        
+        loop_count = 0
         try:
             while True:
                 t_start = time.time()
+                loop_count += 1
+                
+                # Check for shutdown signal from teleop (B button safety feature)
+                if loop_count % 100 == 0:  # Check every 100 loops to avoid too many Redis calls
+                    shutdown_signal = self.redis_client.get("robot_shutdown")
+                    if shutdown_signal and shutdown_signal.decode() == "1":
+                        print("\n[SHUTDOWN] Received shutdown signal from teleop!")
+                        print("[SHUTDOWN] Stopping robot for safety...")
+                        # Clear the shutdown signal
+                        self.redis_client.delete("robot_shutdown")
+                        break
 
                 # Send remote control signals to Redis for motion server
                 if self.redis_client:
@@ -408,8 +440,26 @@ class RealTimePolicyController(object):
                 raw_action = np.clip(raw_action, -10.0, 10.0)
                 target_dof_pos = self.default_dof_pos + raw_action * self.action_scale
 
-                # HYBRID MODE: Use LocoMode for legs ONLY when walking (velocity command received)
+                # HYBRID MODE: Use LocoMode or TWIST2 based on teleop state
                 if self.hybrid_loco_mode and self.loco_policy is not None:
+                    # Startup grace period: use TWIST2 for first N seconds to let robot stand
+                    if not hasattr(self, '_startup_time'):
+                        self._startup_time = time.time()
+                    startup_grace_seconds = 3.0  # Use TWIST2 for first 3 seconds
+                    in_startup_grace = (time.time() - self._startup_time) < startup_grace_seconds
+                    
+                    # Read teleop state from Redis (hybrid_loco_teleop.py sends effective state)
+                    teleop_state_str = self.redis_client.get("teleop_state_info")
+                    teleop_state = "teleop_full"  # Default to full teleop
+                    if teleop_state_str:
+                        try:
+                            state_info = json.loads(teleop_state_str)
+                            # "state" field now contains effective state (target during interpolation)
+                            teleop_state = state_info.get("state", "teleop_full")
+                        except Exception as e:
+                            print(f"[HYBRID] Error parsing state: {e}")
+                            pass
+                    
                     # Read velocity command from Redis
                     vel_cmd_str = self.redis_client.get("loco_vel_cmd")
                     if vel_cmd_str:
@@ -417,33 +467,47 @@ class RealTimePolicyController(object):
                     else:
                         vel_cmd = np.zeros(3, dtype=np.float32)
                     
-                    # Check if velocity command is significant (above threshold)
-                    vel_magnitude = np.linalg.norm(vel_cmd)
-                    vel_threshold = 0.05  # Only use LocoMode if joystick is moved significantly
+                    # ONLY use LocoMode if explicitly in teleop_loco state
+                    # All other states (paused, idle, preview, teleop_full, startup) use TWIST2
+                    # Also force TWIST2 during startup grace period
+                    use_locomode = (teleop_state == "teleop_loco") and not in_startup_grace
                     
-                    if vel_magnitude > vel_threshold:
-                        # Debug: print velocity command
-                        if not hasattr(self, '_last_vel_print') or (time.time() - self._last_vel_print) > 0.5:
-                            print(f"[DEBUG] Using vel_cmd: {vel_cmd} (magnitude: {vel_magnitude:.3f})")
-                            self._last_vel_print = time.time()
-                        
-                        # TEST MODE: PURE RoboMimic - Use LocoMode when velocity is significant
+                    # Detect mode switch TO LocoMode - reset policy to avoid stale action history
+                    was_in_locomode = getattr(self, '_was_in_locomode', False)
+                    if use_locomode and not was_in_locomode:
+                        # Switching TO LocoMode - reset policy buffers
+                        self.loco_policy.reset()
+                    self._was_in_locomode = use_locomode
+                    
+                    # Debug: print state changes
+                    if not hasattr(self, '_last_teleop_state') or self._last_teleop_state != teleop_state or \
+                       (in_startup_grace and not hasattr(self, '_printed_startup_msg')):
+                        grace_msg = " (startup grace - forcing TWIST2)" if in_startup_grace else ""
+                        print(f"[HYBRID] Teleop state: {teleop_state} → {'LocoMode' if use_locomode else 'TWIST2'}{grace_msg}")
+                        self._last_teleop_state = teleop_state
+                        if in_startup_grace:
+                            self._printed_startup_msg = True
+                    
+                    if use_locomode:
+                        # LOCOMOTION MODE: Use LocoMode for legs
                         # Get gravity orientation from IMU quaternion
                         gravity_ori = get_gravity_orientation_from_quat(quat)
                         
-                        # Compute LocoMode (exactly like RoboMimic)
+                        # Compute LocoMode (robot will crouch even with zero velocity)
                         loco_action, loco_kps, loco_kds = self.loco_policy.compute(
                             dof_pos,     # Real robot joint positions
                             dof_vel,     # Real robot joint velocities  
                             ang_vel,     # Real robot angular velocity
                             gravity_ori, # Gravity orientation from IMU
-                            vel_cmd      # Velocity command
+                            vel_cmd      # Velocity command (can be zero)
                         )
                         
-                        # PURE ROBOMIMIC: Use LocoMode legs + default upper body
-                        # LocoMode only outputs legs (0-11), rest are zeros
-                        target_dof_pos = loco_action.copy()
-                        target_dof_pos[12:] = self.default_dof_pos[12:]  # Upper body from default pose
+                        # LocoMode for legs + waist, ARMS TRACK from TWIST2
+                        # Use LocoMode output for legs (0-11)
+                        target_dof_pos[:12] = loco_action[:12]
+                        # Waist (12-14) uses LocoMode's default pose for stability
+                        target_dof_pos[12:15] = self.loco_policy.default_angles_reorder[12:15]
+                        # Arms (15-28) keep TWIST2 tracking output (already set above)
                         
                         # Use RoboMimic's PD gains for legs, config gains for upper body
                         final_kps = loco_kps.copy()
@@ -452,7 +516,7 @@ class RealTimePolicyController(object):
                             final_kps[i] = self.config.kps[i]
                             final_kds[i] = self.config.kds[i]
                         
-                        # Send with RoboMimic's PD gains
+                        # Send with mixed PD gains
                         cmd = self.env.robot.create_zero_command()
                         cmd.q_target = target_dof_pos.copy()
                         cmd.dq_target = np.zeros_like(target_dof_pos)
@@ -461,9 +525,7 @@ class RealTimePolicyController(object):
                         cmd.tau_ff = np.zeros_like(target_dof_pos)
                         self.env.send_cmd(cmd)
                     else:
-                        # Velocity too small - use TWIST2 policy instead (prevents stepping when joystick centered)
-                        # This prevents the zero-velocity → middle-velocity mapping issue
-                        # Fall through to use TWIST2 policy (same as non-hybrid mode)
+                        # FULL TELEOP MODE: Use TWIST2 policy for all joints
                         kp_scale = 1.0
                         kd_scale = 1.0
                         self.env.send_robot_action(target_dof_pos, kp_scale, kd_scale)
@@ -474,7 +536,14 @@ class RealTimePolicyController(object):
                     self.env.send_robot_action(target_dof_pos, kp_scale, kd_scale)
                 
                 if self.use_hand:
-                    self.hand_ctrl.ctrl_dual_hand(action_hand_left, action_hand_right)
+                    # In locomotion mode, use default hand pose instead of tracking
+                    if self.hybrid_loco_mode and getattr(self, '_was_in_locomode', False):
+                        # Default relaxed hand pose (open hands)
+                        default_hand = np.zeros(7, dtype=np.float32)
+                        self.hand_ctrl.ctrl_dual_hand(default_hand, default_hand)
+                    else:
+                        # Normal tracking mode
+                        self.hand_ctrl.ctrl_dual_hand(action_hand_left, action_hand_right)
                 
                 elapsed = time.time() - t_start
                 if elapsed < self.control_dt:

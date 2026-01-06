@@ -104,7 +104,23 @@ class LocoModePolicy:
         self.qj_obs = np.zeros(self.num_actions, dtype=np.float32)
         self.dqj_obs = np.zeros(self.num_actions, dtype=np.float32)
         
+        # Track if policy needs reset on mode switch
+        self._needs_reset = True
+        
+        # Reorder default angles for motor indices (for upper body default pose)
+        self.default_angles_reorder = np.zeros(29, dtype=np.float32)
+        for i in range(len(self.joint2motor_idx)):
+            motor_idx = self.joint2motor_idx[i]
+            self.default_angles_reorder[motor_idx] = self.default_angles[i]
+        
         print(f"[LocoMode] Policy loaded from {self.policy_path}")
+    
+    def reset(self):
+        """Reset action buffer - call when switching to LocoMode to avoid stale history"""
+        self.action = np.zeros(self.num_actions, dtype=np.float32)
+        self.obs = np.zeros(self.num_obs, dtype=np.float32)
+        self._needs_reset = False
+        print("[LocoMode] Action buffer reset for clean mode switch")
     
     def compute(self, qj, dqj, ang_vel, gravity_ori, vel_cmd):
         """Compute leg joint positions from velocity command"""
@@ -189,6 +205,9 @@ class RealTimePolicyController:
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
             self.redis_pipeline = self.redis_client.pipeline()
+            # Clear any previous shutdown signal on startup
+            self.redis_client.delete("robot_shutdown")
+            print("[SAFETY] Shutdown signal cleared - ready for operation")
         except Exception as e:
             print(f"Error connecting to Redis: {e}")
 
@@ -257,12 +276,14 @@ class RealTimePolicyController:
                 40, 40, 40, 40, 4.0, 4.0, 4.0,
                 40, 40, 40, 40, 4.0, 4.0, 4.0,
             ])
+        # Heavy damping for smooth motion (increased 5-10x from original)
+        # Original: [2,2,2,4,2,2, 2,2,2,4,2,2, 4,4,4, 5,5,5,5,0.2,0.2,0.2, 5,5,5,5,0.2,0.2,0.2]
         self.damping = np.array([
-                2, 2, 2, 4, 2, 2,
-                2, 2, 2, 4, 2, 2,
-                4, 4, 4,
-                5, 5, 5, 5, 0.2, 0.2, 0.2,
-                5, 5, 5, 5, 0.2, 0.2, 0.2,
+                15, 15, 15, 25, 15, 15,   # left leg (was 2,2,2,4,2,2)
+                15, 15, 15, 25, 15, 15,   # right leg (was 2,2,2,4,2,2)
+                25, 25, 25,               # waist (was 4,4,4)
+                20, 20, 20, 20, 2.0, 2.0, 2.0,  # left arm (was 5,5,5,5,0.2,0.2,0.2)
+                20, 20, 20, 20, 2.0, 2.0, 2.0,  # right arm (was 5,5,5,5,0.2,0.2,0.2)
             ])
 
         
@@ -368,6 +389,17 @@ class RealTimePolicyController:
         try:
             for i in pbar:
                 t_start = time.time()
+                
+                # Check for shutdown signal from teleop (B button safety feature)
+                if i % 100 == 0:  # Check every 100 steps to avoid too many Redis calls
+                    shutdown_signal = self.redis_client.get("robot_shutdown")
+                    if shutdown_signal and shutdown_signal.decode() == "1":
+                        print("\n[SHUTDOWN] Received shutdown signal from teleop!")
+                        print("[SHUTDOWN] Stopping robot server for safety...")
+                        # Clear the shutdown signal
+                        self.redis_client.delete("robot_shutdown")
+                        break
+                
                 dof_pos, dof_vel, quat, ang_vel, sim_torque = self.extract_data()
                 
                 # Read velocity command from Redis every step (for hybrid mode)
@@ -484,46 +516,111 @@ class RealTimePolicyController:
                     scaled_actions = raw_action * self.action_scale
                     pd_target = scaled_actions + self.default_dof_pos
                     
-                    # HYBRID MODE: Use LocoMode for legs when velocity command received
-                    if self.hybrid_loco_mode and self.loco_policy is not None and vel_cmd is not None:
-                        # Check if velocity command is significant (above threshold)
-                        vel_magnitude = np.linalg.norm(vel_cmd)
-                        vel_threshold = 0.05  # Only use LocoMode if joystick is moved significantly
+                    # HYBRID MODE: Use LocoMode or TWIST2 based on teleop state
+                    if self.hybrid_loco_mode and self.loco_policy is not None:
+                        # Startup grace period: use TWIST2 for first N seconds to let robot stand
+                        if not hasattr(self, '_startup_time'):
+                            self._startup_time = time.time()
+                        startup_grace_seconds = 3.0  # Use TWIST2 for first 3 seconds
+                        in_startup_grace = (time.time() - self._startup_time) < startup_grace_seconds
                         
-                        if vel_magnitude > vel_threshold:
-                            # Debug: print velocity command
-                            if not hasattr(self, '_last_vel_print') or (time.time() - self._last_vel_print) > 0.5:
-                                print(f"[DEBUG] Using vel_cmd: {vel_cmd} (magnitude: {vel_magnitude:.3f})")
-                                self._last_vel_print = time.time()
-                            
-                            # Get gravity orientation from quaternion
+                        # Read teleop state from Redis (hybrid_loco_teleop.py sends effective state)
+                        teleop_state_str = self.redis_client.get("teleop_state_info")
+                        teleop_state = "teleop_full"  # Default to full teleop
+                        if teleop_state_str:
+                            try:
+                                state_info = json.loads(teleop_state_str)
+                                # "state" field now contains effective state (target during interpolation)
+                                teleop_state = state_info.get("state", "teleop_full")
+                            except Exception as e:
+                                pass
+                        
+                        # ONLY use LocoMode if explicitly in teleop_loco state
+                        # All other states (paused, idle, preview, teleop_full, startup) use TWIST2
+                        # Also force TWIST2 during startup grace period
+                        use_locomode = (teleop_state == "teleop_loco") and not in_startup_grace
+                        
+                        # ===== SERVER-SIDE INTERPOLATION FOR SMOOTH MODE TRANSITIONS =====
+                        # Initialize interpolation state if not exists
+                        if not hasattr(self, '_mode_interp_active'):
+                            self._mode_interp_active = False
+                            self._mode_interp_start_time = 0.0
+                            self._mode_interp_start_target = None
+                            self._mode_interp_duration = 1.0  # 1 second transition
+                        
+                        # Detect mode switch - start interpolation
+                        was_in_locomode = getattr(self, '_was_in_locomode', False)
+                        if use_locomode != was_in_locomode:
+                            # Mode changed! Start interpolation from current position
+                            self._mode_interp_active = True
+                            self._mode_interp_start_time = time.time()
+                            self._mode_interp_start_target = dof_pos.copy()  # Start from current robot position
+                            if use_locomode:
+                                self.loco_policy.reset()
+                                print(f"\n[HYBRID] Starting smooth transition → LocoMode (1.0s)")
+                            else:
+                                print(f"\n[HYBRID] Starting smooth transition → TWIST2 (1.0s)")
+                        self._was_in_locomode = use_locomode
+                        
+                        # Debug: print state changes (only when not transitioning)
+                        if not self._mode_interp_active:
+                            if not hasattr(self, '_last_teleop_state') or self._last_teleop_state != teleop_state or \
+                               (in_startup_grace and not hasattr(self, '_printed_startup_msg')):
+                                grace_msg = " (startup grace - forcing TWIST2)" if in_startup_grace else ""
+                                print(f"[HYBRID] Teleop state: {teleop_state} → {'LocoMode' if use_locomode else 'TWIST2'}{grace_msg}")
+                                self._last_teleop_state = teleop_state
+                                if in_startup_grace:
+                                    self._printed_startup_msg = True
+                        
+                        # Compute target for current mode
+                        if use_locomode:
+                            # LOCOMOTION MODE: Use LocoMode for legs
                             gravity_ori = get_gravity_orientation_from_quat(quat)
+                            if vel_cmd is None:
+                                vel_cmd = np.zeros(3, dtype=np.float32)
                             
-                            # Always compute LocoMode (exactly like RoboMimic)
                             loco_action, loco_kps, loco_kds = self.loco_policy.compute(
-                                dof_pos,     # Current joint positions
-                                dof_vel,     # Current joint velocities  
-                                ang_vel,     # Angular velocity
-                                gravity_ori, # Gravity orientation
-                                vel_cmd      # Velocity command
+                                dof_pos, dof_vel, ang_vel, gravity_ori, vel_cmd
                             )
                             
-                            # PURE ROBOMIMIC: Use LocoMode legs + default upper body
-                            pd_target = loco_action.copy()
-                            pd_target[12:] = self.default_dof_pos[12:]  # Upper body from default pose
+                            # LocoMode target: legs from policy, waist at default, ARMS TRACK from TWIST2
+                            mode_target = pd_target.copy()
+                            mode_target[:12] = loco_action[:12]           # Legs from LocoMode
+                            mode_target[12:15] = self.loco_policy.default_angles_reorder[12:15]  # Waist at default
+                            # Arms (15-28) keep TWIST2 tracking output from pd_target
                             
-                            # Store LocoMode PD gains for use in torque computation
-                            # We'll use these instead of default stiffness/damping for legs
+                            # Store LocoMode PD gains
                             self.loco_kps = loco_kps.copy()
                             self.loco_kds = loco_kds.copy()
-                            # Use default gains for upper body
                             for i in range(12, 29):
                                 self.loco_kps[i] = self.stiffness[i]
                                 self.loco_kds[i] = self.damping[i]
                         else:
-                            # Velocity too small - use TWIST2 policy instead (prevents stepping when joystick centered)
-                            # This prevents the zero-velocity → middle-velocity mapping issue
-                            pass
+                            # FULL TELEOP MODE: Use TWIST2 policy (pd_target already set)
+                            mode_target = pd_target.copy()
+                            if hasattr(self, 'loco_kps'):
+                                delattr(self, 'loco_kps')
+                            if hasattr(self, 'loco_kds'):
+                                delattr(self, 'loco_kds')
+                        
+                        # Apply interpolation if active
+                        if self._mode_interp_active:
+                            elapsed = time.time() - self._mode_interp_start_time
+                            alpha = min(1.0, elapsed / self._mode_interp_duration)
+                            
+                            # Smootherstep for acceleration-capped transition
+                            alpha = alpha * alpha * alpha * (alpha * (6 * alpha - 15) + 10)
+                            
+                            # Interpolate from start position to mode target
+                            pd_target[:] = (1.0 - alpha) * self._mode_interp_start_target + alpha * mode_target
+                            
+                            # Check if interpolation complete
+                            if elapsed >= self._mode_interp_duration:
+                                self._mode_interp_active = False
+                                print(f"[HYBRID] Transition complete → {'LocoMode' if use_locomode else 'TWIST2'}")
+                        else:
+                            # No interpolation - use mode target directly
+                            pd_target[:] = mode_target
 
                     # self.redis_client.set("action_low_level_unitree_g1", json.dumps(raw_action.tolist()))
                     

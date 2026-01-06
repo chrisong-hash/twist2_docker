@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """
-Hybrid Locomotion + Teleoperation System
-=========================================
-This integrates with the existing TWIST2 workflow:
+Hybrid Locomotion + Teleoperation System v2
+============================================
+Improved state machine with smooth transitions and latching controls.
 
-1. Start XRobotToolkit on Pico
-2. Connect using the app
-3. Run this script
-4. MuJoCo preview shows motion - calibrate until tracking works
-5. Press button to enable robot locomotion
+States:
+  idle        : Waiting for Pico VR data
+  preview     : MuJoCo shows your motion (calibrate here)
+  teleop_full : Full body teleop (TWIST2 controls all joints)
+  teleop_loco : Locomotion mode (LocoMode legs + GMR upper body)
+  paused      : Robot holds default standing pose
 
-Lower body (joints 0-11): RoboMimic LocoMode policy (joystick → walking)
-Upper body (joints 12-28): TWIST2 GMR tracking (Pico VR → arm/waist motion)
+Controls:
+  Right A (key_one)  : Toggle preview ↔ teleop mode
+  Right Grip         : Toggle teleop_full ↔ teleop_loco (latching)
+  Left A (key_one)   : Toggle pause (latching)
+  B button (key_two) : EMERGENCY SHUTDOWN (stops teleop + robot server)
+  Left joystick      : Walk (in teleop_loco mode)
+  Right joystick     : Rotate (in teleop_loco mode)
+
+All mode transitions have smooth 1-second interpolation.
 """
 
 import argparse
@@ -217,6 +225,9 @@ class LocoModePolicy:
         self.obs = np.zeros(self.num_obs, dtype=np.float32)
         self.action = np.zeros(self.num_actions, dtype=np.float32)
         
+        # Track if policy needs reset on mode switch
+        self._needs_reset = True
+        
         # Load policy
         self.policy = torch.jit.load(self.policy_path)
         
@@ -277,6 +288,13 @@ class LocoModePolicy:
             action_reorder[motor_idx] = loco_action[i]
                 
         return action_reorder
+    
+    def reset(self):
+        """Reset action buffer - call when switching to LocoMode to avoid stale history"""
+        self.action = np.zeros(self.num_actions, dtype=np.float32)
+        self.obs = np.zeros(self.num_obs, dtype=np.float32)
+        self._needs_reset = False
+        print("[LocoMode] Action buffer reset for clean mode switch")
 
 
 def extract_mimic_obs(qpos, last_qpos, dt=1/30):
@@ -302,40 +320,72 @@ def extract_mimic_obs(qpos, last_qpos, dt=1/30):
 
 class HybridLocoTeleop:
     """
-    Hybrid system: LocoMode legs + TWIST2 GMR upper body
+    Hybrid system with improved state machine and smooth transitions.
     
-    Follows same workflow as teleop_inspire.sh:
-    1. Connect to Pico via XRobotStreamer
-    2. Preview in MuJoCo
-    3. Enable robot via button
+    States:
+      idle        : Waiting for Pico VR data
+      preview     : MuJoCo shows your motion (calibrate here)
+      teleop_full : Full body teleop (TWIST2 controls all joints)
+      teleop_loco : Locomotion mode (LocoMode legs + GMR upper body)
+      paused      : Robot holds default standing pose
+    
+    All mode transitions use 1-second interpolation for smooth motion.
     """
+    
+    # Interpolation duration in seconds
+    INTERP_DURATION = 1.0
+    
+    # Default standing pose for legs (used in pause and teleop_full)
+    DEFAULT_STANDING_LEGS = np.array([
+        -0.2, 0.0, 0.0, 0.42, -0.23, 0.0,  # left leg
+        -0.2, 0.0, 0.0, 0.42, -0.23, 0.0,  # right leg
+    ], dtype=np.float32)
     
     def __init__(self, args):
         self.args = args
         self.robot_name = "unitree_g1"
         
-        # State machine
-        self.state = "idle"  # idle -> preview -> teleop -> exit
-        self.locomotion_enabled = False
+        # State machine - valid states: idle, preview, teleop_full, teleop_loco, paused, exit
+        self.state = "idle"
+        self.previous_teleop_state = "teleop_full"  # Remember which teleop state to return to from pause
         self.vel_cmd = np.zeros(3, dtype=np.float32)
         
-        # Height estimation
-        self.estimated_height = args.actual_human_height  # Start with default
-        self.height_samples = []  # Collect samples for averaging
-        self.height_estimation_done = False
-        self.height_estimation_frames = 0
-        self.retarget = None  # Will be initialized after height estimation
+        # Interpolation state
+        self.is_interpolating = False
+        self.interp_start_time = 0.0
+        self.interp_start_qpos = None  # Starting joint positions
+        self.interp_target_qpos = None  # Target joint positions
+        self.interp_from_state = None   # State we're transitioning from
+        self.interp_to_state = None     # State we're transitioning to
+        
+        # Button state tracking (for edge detection)
+        self._right_key_was_pressed = False
+        self._left_key_was_pressed = False
+        self._b_key_was_pressed = False
+        self._right_grip_was_pressed = False
+        
+        # Height setting
+        self.estimated_height = args.actual_human_height
+        self.retarget = None  # Will be initialized in _setup_retargeting
+        
+        # Smooth filtering settings
+        self.enable_smooth = args.smooth
+        self.smooth_window_size = args.smooth_window_size
+        self.smooth_history = []  # Store recent observations for sliding window
         
         # Initialize systems
-        print("\n[cyan]Initializing Hybrid Locomotion + Teleoperation...[/cyan]")
+        print("\n[cyan]Initializing Hybrid Locomotion + Teleoperation v2...[/cyan]")
         self._setup_locomotion_policy()
         self._setup_teleop_streamer()
-        # Don't setup retargeting yet - wait for height estimation
+        self._setup_retargeting()  # Initialize GMR with default height
         self._setup_mujoco()
         self._setup_redis()
         
         print("\n[green]Systems initialized![/green]")
-        print(f"[yellow]Height estimation: Waiting for Pico data... (default: {self.estimated_height:.2f}m)[/yellow]")
+        if self.enable_smooth:
+            print(f"[cyan]Smooth filtering: ENABLED (window size: {self.smooth_window_size} frames)[/cyan]")
+        else:
+            print("[yellow]Smooth filtering: DISABLED[/yellow]")
         self._print_controls()
     
     def _setup_locomotion_policy(self):
@@ -361,6 +411,7 @@ class HybridLocoTeleop:
     
     def _setup_retargeting(self, height=None):
         """Initialize GMR for upper body retargeting with given height"""
+        print("\n[3/5] Setting up GMR retargeting...")
         if height is None:
             height = self.estimated_height
         
@@ -376,6 +427,7 @@ class HybridLocoTeleop:
             )
         finally:
             sys.stdout = old_stdout
+        print(f"[green]GMR initialized (height: {height:.2f}m)[/green]")
     
     def _setup_mujoco(self):
         """Setup MuJoCo simulation for preview"""
@@ -398,29 +450,45 @@ class HybridLocoTeleop:
         self.redis_client = redis.Redis(host=self.args.redis_ip, port=6379, db=0)
         self.redis_pipeline = self.redis_client.pipeline()
         self.redis_client.ping()
+        # Clear any previous shutdown signal
+        self.redis_client.delete("robot_shutdown")
         print("[green]Redis connected[/green]")
+    
+    def _send_shutdown_signal(self):
+        """Send shutdown signal to robot server via Redis"""
+        try:
+            # Send shutdown signal that server will check
+            self.redis_client.set("robot_shutdown", "1")
+            print("[red]  Shutdown signal sent![/red]")
+        except Exception as e:
+            print(f"[red]  Warning: Could not send shutdown signal: {e}[/red]")
     
     def _print_controls(self):
         print("\n" + "="*60)
-        print("  HYBRID LOCOMOTION + TELEOPERATION")
+        print("  HYBRID LOCOMOTION + TELEOPERATION v2")
         print("="*60)
         print("\n[yellow]Controls:[/yellow]")
-        print("  Right A button (key_one): Toggle preview/teleop mode")
-        print("  B button (key_two)      : Exit program")
-        print("  Left A button (key_one) : Exit program (alternate)")
-        print("  Left joystick           : Walk forward/back/strafe")
-        print("  Right joystick          : Rotate left/right")
-        print("  Right trigger           : HOLD to enable leg locomotion")
+        print("  Right A (key_one)  : Toggle preview ↔ teleop")
+        print("  Right Grip         : Toggle teleop_full ↔ teleop_loco (latching)")
+        print("  Left A (key_one)   : Toggle pause (latching)")
+        print("  [red]B button (key_two) : EMERGENCY SHUTDOWN[/red]")
+        print("  Left joystick      : Walk (only in teleop_loco)")
+        print("  Right joystick     : Rotate (only in teleop_loco)")
         print("\n[yellow]States:[/yellow]")
-        print("  idle    : Waiting for Pico data")
-        print("  preview : MuJoCo shows your motion (calibrate here)")
-        print("  teleop  : Sending to robot via Redis")
+        print("  idle        : Waiting for Pico data")
+        print("  preview     : MuJoCo preview (calibrate here)")
+        print("  teleop_full : Full body teleop (default)")
+        print("  teleop_loco : Locomotion mode (legs walk, upper tracks)")
+        print("  paused      : Robot at default standing pose")
         print("\n[cyan]Workflow:[/cyan]")
-        print("  1. Ensure Pico is connected via XRobotToolkit app")
-        print("  2. Move around until MuJoCo reflects your motion")
-        print("  3. Press Right A to enter teleop mode")
-        print("  4. HOLD Right Trigger + use joystick to walk")
-        print("  5. Release trigger to stop walking (upper body still tracks)")
+        print("  1. Connect Pico via XRobotToolkit → auto enters preview")
+        print("  2. Calibrate until MuJoCo reflects your motion")
+        print("  3. Press Right A → enters teleop_full (full body teleop)")
+        print("  4. Press Right Grip → switches to teleop_loco (walking mode)")
+        print("  5. Use joysticks to walk in teleop_loco")
+        print("  6. Press Right Grip again → back to teleop_full")
+        print("  7. Press Left A anytime → pause/unpause")
+        print("\n[cyan]Note:[/cyan] All transitions have 1-second smooth interpolation")
         print("="*60 + "\n")
     
     def get_teleop_data(self):
@@ -433,74 +501,180 @@ class HybridLocoTeleop:
                 return None, None, None, None, None
         return None, None, None, None, None
     
-    def update_state(self, controller_data):
-        """Update state machine based on controller input"""
+    def _start_interpolation(self, from_state, to_state, current_qpos):
+        """Start interpolation from current pose to target state's pose"""
+        self.is_interpolating = True
+        self.interp_start_time = time.time()
+        self.interp_from_state = from_state
+        self.interp_to_state = to_state
+        
+        # Reset smooth history on state transition to avoid carrying old data
+        self.reset_smooth_history()
+        
+        # Reset LocoMode policy when switching TO teleop_loco to avoid stale action history
+        if to_state == "teleop_loco":
+            self.loco_policy.reset()
+        
+        # Save starting position
+        if current_qpos is not None:
+            self.interp_start_qpos = current_qpos.copy()
+        else:
+            # Use MuJoCo's current qpos as fallback
+            self.interp_start_qpos = self.data.qpos.copy()
+        
+        # Determine target position based on target state
+        self.interp_target_qpos = self.interp_start_qpos.copy()
+        
+        if to_state == "paused":
+            # Target: default standing pose for all joints
+            self.interp_target_qpos[7:7+12] = self.DEFAULT_STANDING_LEGS
+            # Keep upper body at current position (will be overwritten if we have retarget data)
+        elif to_state == "teleop_full":
+            # Target: current retargeted pose (full body from GMR)
+            # In teleop_full, entire body tracks - no override needed
+            # interp_target_qpos is already set from current_qpos (GMR tracking)
+            pass
+        elif to_state == "teleop_loco":
+            # Target: locomotion mode - legs + waist from LocoMode, ARMS TRACK from GMR
+            self.interp_target_qpos[7:7+12] = self.loco_policy.default_angles_reorder[:12]  # Legs
+            self.interp_target_qpos[7+12:7+15] = self.loco_policy.default_angles_reorder[12:15]  # Waist
+            # Arms (7+15:7+29) keep GMR tracking from interp_start_qpos
+        
+        print(f"\n[cyan]→ Interpolating: {from_state} → {to_state} (1.0s)[/cyan]")
+    
+    def _get_interpolated_qpos(self, current_target_qpos):
+        """Get interpolated qpos between start and target"""
+        if not self.is_interpolating:
+            return current_target_qpos
+        
+        elapsed = time.time() - self.interp_start_time
+        alpha = min(1.0, elapsed / self.INTERP_DURATION)
+        
+        # Apply smootherstep for acceleration-capped transition
+        # This transforms linear alpha into smooth S-curve with zero velocity/acceleration at boundaries
+        # Formula: 6t^5 - 15t^4 + 10t^3 (quintic smoothstep)
+        alpha = alpha * alpha * alpha * (alpha * (6 * alpha - 15) + 10)
+        
+        # Update target position with current data (if available)
+        if current_target_qpos is not None:
+            self.interp_target_qpos = current_target_qpos.copy()
+            # Apply state-specific poses
+            if self.interp_to_state == "paused":
+                self.interp_target_qpos[7:7+12] = self.DEFAULT_STANDING_LEGS
+            elif self.interp_to_state == "teleop_full":
+                # In teleop_full, entire body tracks GMR - no override needed
+                pass
+            elif self.interp_to_state == "teleop_loco":
+                # Locomotion mode: legs + waist at LocoMode default, arms track GMR
+                self.interp_target_qpos[7:7+12] = self.loco_policy.default_angles_reorder[:12]  # Legs
+                self.interp_target_qpos[7+12:7+15] = self.loco_policy.default_angles_reorder[12:15]  # Waist
+                # Arms (7+15:7+29) keep GMR tracking
+        
+        # Linear interpolation
+        interpolated = (1.0 - alpha) * self.interp_start_qpos + alpha * self.interp_target_qpos
+        
+        # Check if interpolation is complete
+        if alpha >= 1.0:
+            self.is_interpolating = False
+            self.state = self.interp_to_state
+            print(f"\n[green]→ {self.state.upper()} mode active[/green]")
+        
+        return interpolated
+    
+    def update_state(self, controller_data, current_qpos=None):
+        """Update state machine based on controller input
+        
+        Args:
+            controller_data: Dict with RightController and LeftController data
+            current_qpos: Current robot qpos for interpolation (optional)
+        """
         if controller_data is None:
             return
         
+        # Don't process button inputs during interpolation (except exit)
         # Controller data has nested structure: {'RightController': {...}, 'LeftController': {...}}
         right_ctrl = controller_data.get("RightController", {})
         left_ctrl = controller_data.get("LeftController", {})
         
-        # Right A button - toggle state
-        right_key_one = right_ctrl.get("key_one", False)
-        if right_key_one and not self._right_key_was_pressed:
-            if self.state == "idle":
-                self.state = "preview"
-                print("[cyan]→ PREVIEW mode: MuJoCo shows your motion[/cyan]")
-            elif self.state == "preview":
-                self.state = "teleop"
-                print("[green]→ TELEOP mode: Sending to robot![/green]")
-            elif self.state == "teleop":
-                self.state = "preview"
-                print("[cyan]→ PREVIEW mode: Robot paused[/cyan]")
+        # Get current button states
+        right_key_one = right_ctrl.get("key_one", False)  # Right A
+        left_key_one = left_ctrl.get("key_one", False)    # Left A (X button)
+        right_key_two = right_ctrl.get("key_two", False)  # Right B
+        left_key_two = left_ctrl.get("key_two", False)    # Left B (Y button)
+        right_grip = right_ctrl.get("grip", False)        # Right Grip
+        
+        # Convert bool to float if needed
+        if isinstance(right_grip, (int, float)):
+            right_grip = right_grip > 0.5
+        
+        # Detect button presses (rising edge)
+        right_a_pressed = right_key_one and not self._right_key_was_pressed
+        left_a_pressed = left_key_one and not self._left_key_was_pressed
+        b_pressed = (right_key_two or left_key_two) and not self._b_key_was_pressed
+        grip_pressed = right_grip and not self._right_grip_was_pressed
+        
+        # B button - always exit (even during interpolation)
+        # Also sends shutdown signal to robot server for safety
+        if b_pressed:
+            self.state = "exit"
+            print("\n[red]→ EMERGENCY SHUTDOWN requested (B button)[/red]")
+            print("[red]  Sending shutdown signal to robot server...[/red]")
+            self._send_shutdown_signal()
+        
+        # Process other buttons only if not interpolating
+        if not self.is_interpolating and self.state != "exit":
+            
+            # Right A - toggle preview ↔ teleop
+            if right_a_pressed:
+                if self.state == "idle":
+                    self.state = "preview"
+                    print("\n[cyan]→ PREVIEW mode: MuJoCo shows your motion[/cyan]")
+                elif self.state == "preview":
+                    # Enter teleop_full by default (with interpolation)
+                    self._start_interpolation("preview", "teleop_full", current_qpos)
+                elif self.state in ["teleop_full", "teleop_loco"]:
+                    # Back to preview (with interpolation)
+                    self._start_interpolation(self.state, "preview", current_qpos)
+                elif self.state == "paused":
+                    # Back to previous teleop state (with interpolation)
+                    self._start_interpolation("paused", self.previous_teleop_state, current_qpos)
+            
+            # Right Grip - toggle teleop_full ↔ teleop_loco
+            if grip_pressed:
+                if self.state == "teleop_full":
+                    self._start_interpolation("teleop_full", "teleop_loco", current_qpos)
+                elif self.state == "teleop_loco":
+                    self._start_interpolation("teleop_loco", "teleop_full", current_qpos)
+            
+            # Left A - toggle pause
+            if left_a_pressed:
+                if self.state in ["teleop_full", "teleop_loco"]:
+                    # Remember which state to return to
+                    self.previous_teleop_state = self.state
+                    self._start_interpolation(self.state, "paused", current_qpos)
+                elif self.state == "paused":
+                    # Return to previous teleop state
+                    self._start_interpolation("paused", self.previous_teleop_state, current_qpos)
+        
+        # Update button state tracking
         self._right_key_was_pressed = right_key_one
-        
-        # Left A button - exit
-        left_key_one = left_ctrl.get("key_one", False)
-        if left_key_one and not self._left_key_was_pressed:
-            self.state = "exit"
-            print("\n→ EXIT requested (Left A)")
         self._left_key_was_pressed = left_key_one
-        
-        # B button (key_two) on either controller - exit
-        right_key_two = right_ctrl.get("key_two", False)
-        left_key_two = left_ctrl.get("key_two", False)
-        if (right_key_two or left_key_two) and not self._b_key_was_pressed:
-            self.state = "exit"
-            print("\n→ EXIT requested (B button)")
         self._b_key_was_pressed = right_key_two or left_key_two
+        self._right_grip_was_pressed = right_grip
         
-        # Joystick for locomotion
+        # Joystick for locomotion - only active in teleop_loco
         left_axis = left_ctrl.get("axis", [0, 0])
         right_axis = right_ctrl.get("axis", [0, 0])
         
-        # Debug: print raw joystick values occasionally
-        if not hasattr(self, '_last_joystick_debug') or (time.time() - self._last_joystick_debug) > 1.0:
-            print(f"[DEBUG] Raw joystick - left_axis: {left_axis}, right_axis: {right_axis}")
-            self._last_joystick_debug = time.time()
-        
-        # Left joystick for movement
-        self.vel_cmd[0] = left_axis[1] if len(left_axis) > 1 else 0.0   # forward/backward
-        self.vel_cmd[1] = -left_axis[0] if len(left_axis) > 0 else 0.0  # strafe
-        # Right joystick for rotation
-        self.vel_cmd[2] = -right_axis[0] if len(right_axis) > 0 else 0.0  # yaw
-        
-        # NO deadzone applied - let RoboMimic policy handle small inputs
-        # RoboMimic's scale_values maps 0 → middle of velocity range, not 0 → 0
-        # Applying deadzone here would cause drift when joystick is centered
-        # The policy was trained to handle small inputs naturally
-        
-        # Right trigger enables locomotion
-        trigger_right = right_ctrl.get("index_trig", 0.0)
-        if isinstance(trigger_right, bool):
-            trigger_right = 1.0 if trigger_right else 0.0
-        self.locomotion_enabled = trigger_right > 0.5
-        
-        # Debug: print when trigger state changes
-        if not hasattr(self, '_last_trigger_state') or self._last_trigger_state != self.locomotion_enabled:
-            print(f"[DEBUG] Locomotion enabled: {self.locomotion_enabled} (trigger: {trigger_right})")
-            self._last_trigger_state = self.locomotion_enabled
+        if self.state == "teleop_loco" or (self.is_interpolating and self.interp_to_state == "teleop_loco"):
+            # Left joystick for movement
+            self.vel_cmd[0] = left_axis[1] if len(left_axis) > 1 else 0.0   # forward/backward
+            self.vel_cmd[1] = -left_axis[0] if len(left_axis) > 0 else 0.0  # strafe
+            # Right joystick for rotation
+            self.vel_cmd[2] = -right_axis[0] if len(right_axis) > 0 else 0.0  # yaw
+        else:
+            # Zero velocity when not in locomotion mode
+            self.vel_cmd[:] = 0.0
     
     def _validate_quaternions(self, smplx_data):
         """Check if smplx_data contains valid quaternions (non-zero norm)"""
@@ -565,35 +739,66 @@ class HybridLocoTeleop:
         self._last_valid_qpos = qpos.copy()
         self._using_fallback = False
         
-        # For MuJoCo visualization only: use standing pose for legs
-        # The actual robot leg control is handled by sim2real with LocoMode + real robot state
-        standing_legs = np.array([
-            -0.2, 0.0, 0.0, 0.42, -0.23, 0.0,  # left leg
-            -0.2, 0.0, 0.0, 0.42, -0.23, 0.0,  # right leg
-        ], dtype=np.float32)
-        qpos[7:7+12] = standing_legs
-        
-        # Upper body (12-28) comes from GMR retargeting - this goes to sim2real via mimic_obs
-        # Legs (0-11) will be computed by LocoMode in sim2real with real robot state feedback
+        # Return full qpos - leg pose will be set based on state in run() loop:
+        # - teleop_full/paused: DEFAULT_STANDING_LEGS
+        # - teleop_loco: GMR legs (sim2real uses LocoMode with real robot state)
+        # - interpolating: blend between states
         
         return qpos
     
+    def _is_locomotion_active(self):
+        """Check if locomotion mode is active (for velocity commands)"""
+        if self.state == "teleop_loco":
+            return True
+        # Also active during interpolation TO teleop_loco
+        if self.is_interpolating and self.interp_to_state == "teleop_loco":
+            # Gradually enable - use interpolation progress
+            elapsed = time.time() - self.interp_start_time
+            alpha = min(1.0, elapsed / self.INTERP_DURATION)
+            return alpha > 0.5  # Enable after halfway through interpolation
+        return False
+    
+    def apply_smooth(self, mimic_obs):
+        """Apply sliding window smoothing to mimic observations to reduce jitter"""
+        if not self.enable_smooth or mimic_obs is None:
+            return mimic_obs
+            
+        # Convert to numpy array if needed
+        obs_array = np.array(mimic_obs) if not isinstance(mimic_obs, np.ndarray) else mimic_obs.copy()
+        
+        # Add current observation to history
+        self.smooth_history.append(obs_array)
+        
+        # Keep only the recent window_size observations
+        if len(self.smooth_history) > self.smooth_window_size:
+            self.smooth_history.pop(0)
+            
+        # Apply sliding window average
+        if len(self.smooth_history) >= 2:  # Need at least 2 observations for smoothing
+            # Stack all observations in history
+            history_stack = np.stack(self.smooth_history, axis=0)  # Shape: (history_len, obs_dim)
+            # Compute mean across the time dimension
+            smoothed_obs = np.mean(history_stack, axis=0)
+            return smoothed_obs
+        else:
+            # Not enough history, return original observation
+            return obs_array
+    
+    def reset_smooth_history(self):
+        """Reset smooth history (call when transitioning states)"""
+        self.smooth_history = []
+    
     def _send_velocity_command_only(self):
         """Send only velocity command to Redis (called every loop iteration in teleop mode)"""
-        if self.locomotion_enabled:
+        if self._is_locomotion_active():
             # Send current velocity command when locomotion is enabled
             vel_cmd_to_send = self.vel_cmd.copy()
             self.redis_client.set(
                 "loco_vel_cmd",
                 json.dumps(vel_cmd_to_send.tolist())
             )
-            # Debug: print when sending non-zero values
-            if np.any(np.abs(vel_cmd_to_send) > 0.01):
-                if not hasattr(self, '_last_vel_send_print') or (time.time() - self._last_vel_send_print) > 0.5:
-                    print(f"\n[DEBUG] Sending vel_cmd to Redis: {vel_cmd_to_send} (locomotion_enabled={self.locomotion_enabled})")
-                    self._last_vel_send_print = time.time()
         else:
-            # Zero velocity when not walking
+            # Zero velocity when not in locomotion mode
             self.redis_client.set(
                 "loco_vel_cmd",
                 json.dumps([0.0, 0.0, 0.0])
@@ -613,8 +818,8 @@ class HybridLocoTeleop:
                 json.dumps(neck_data)
             )
         
-        # Also send velocity command (in case it wasn't sent in _send_velocity_command_only)
-        if self.locomotion_enabled:
+        # Send velocity command based on locomotion state
+        if self._is_locomotion_active():
             self.redis_pipeline.set(
                 "loco_vel_cmd",
                 json.dumps(self.vel_cmd.tolist())
@@ -624,6 +829,26 @@ class HybridLocoTeleop:
                 "loco_vel_cmd",
                 json.dumps([0.0, 0.0, 0.0])
             )
+        
+        # Send current state info (for sim2real to know the mode)
+        # Determine effective state (use target state during interpolation)
+        if self.is_interpolating and self.interp_to_state is not None:
+            effective_state = self.interp_to_state
+        else:
+            effective_state = self.state
+        
+        state_info = {
+            "state": effective_state,  # Send effective state (target during interpolation)
+            "actual_state": self.state,  # For debugging
+            "is_interpolating": self.is_interpolating,
+            "interp_to_state": self.interp_to_state if self.is_interpolating else None,
+        }
+        self.redis_pipeline.set("teleop_state_info", json.dumps(state_info))
+        
+        # Debug: print state being sent (occasionally)
+        if not hasattr(self, '_last_state_debug') or (time.time() - self._last_state_debug) > 2.0:
+            print(f"\n[DEBUG] Sending state: {effective_state} (actual: {self.state}, interp: {self.is_interpolating})")
+            self._last_state_debug = time.time()
         
         t_action = int(time.time() * 1000)
         self.redis_pipeline.set("t_action", t_action)
@@ -635,9 +860,9 @@ class HybridLocoTeleop:
         p = "P" if smplx_data is not None else "-"
         c = "C" if controller is not None else "-"
         
-        # Get joystick values
+        # Get joystick and grip values
         lx, ly, rx = 0.0, 0.0, 0.0
-        trig = 0.0
+        grip = 0
         if controller:
             left_ctrl = controller.get("LeftController", {})
             right_ctrl = controller.get("RightController", {})
@@ -645,22 +870,40 @@ class HybridLocoTeleop:
             right_axis = right_ctrl.get("axis", [0, 0])
             lx, ly = left_axis[0] if len(left_axis) > 0 else 0, left_axis[1] if len(left_axis) > 1 else 0
             rx = right_axis[0] if len(right_axis) > 0 else 0
-            trig = right_ctrl.get("index_trig", 0)
-            if isinstance(trig, bool):
-                trig = 1.0 if trig else 0.0
+            grip_val = right_ctrl.get("grip", 0)
+            grip = 1 if (isinstance(grip_val, bool) and grip_val) or (isinstance(grip_val, (int, float)) and grip_val > 0.5) else 0
         
-        loco = "W" if self.locomotion_enabled else "-"
+        # Interpolation progress
+        if self.is_interpolating:
+            elapsed = time.time() - self.interp_start_time
+            progress = min(100, int(100 * elapsed / self.INTERP_DURATION))
+            interp_str = f"→{self.interp_to_state[:4]}:{progress:2d}%"
+        else:
+            interp_str = "------"
+        
+        loco = "L" if self._is_locomotion_active() else "-"
         fb = "F" if getattr(self, '_using_fallback', False) else "-"
-        # Show if velocity will be sent (teleop mode + locomotion enabled)
-        sending = "SEND" if (self.state == "teleop" and self.locomotion_enabled) else "----"
-        # Compact: [state] P:- C:- L:(+0.0,+0.0) R:+0.0 T:0 W:- F:- v:(+0.0,+0.0,+0.0) SEND
-        status = (f"[{self.state:7s}] {p}{c}{fb} "
-                  f"L:({lx:+.1f},{ly:+.1f}) R:{rx:+.1f} T:{trig:.0f} {loco} "
-                  f"v:({self.vel_cmd[0]:+.1f},{self.vel_cmd[1]:+.1f},{self.vel_cmd[2]:+.1f}) {sending}")
+        
+        # Show state (max 10 chars)
+        state_display = self.state[:10]
+        
+        # Compact status line
+        status = (f"[{state_display:10s}] {p}{c}{fb} G:{grip} {loco} "
+                  f"J:({lx:+.1f},{ly:+.1f},{rx:+.1f}) "
+                  f"v:({self.vel_cmd[0]:+.1f},{self.vel_cmd[1]:+.1f},{self.vel_cmd[2]:+.1f}) {interp_str}")
         
         # Print with carriage return - keep under 80 chars
         sys.stdout.write(f"\r{status:<79}")
         sys.stdout.flush()
+    
+    def _is_teleop_state(self):
+        """Check if current state or interpolation target is a teleop state"""
+        teleop_states = ["teleop_full", "teleop_loco", "paused"]
+        if self.state in teleop_states:
+            return True
+        if self.is_interpolating and self.interp_to_state in teleop_states:
+            return True
+        return False
     
     def run(self):
         """Main loop"""
@@ -669,9 +912,6 @@ class HybridLocoTeleop:
         logging.getLogger("loop_rate_limiters").setLevel(logging.ERROR)
         
         rate = RateLimiter(frequency=self.args.target_fps)
-        self._right_key_was_pressed = False
-        self._left_key_was_pressed = False
-        self._b_key_was_pressed = False
         
         print(f"\nStarting in state: {self.state}")
         print("Waiting for Pico VR data...")
@@ -709,31 +949,43 @@ class HybridLocoTeleop:
                     else:
                         no_data_warnings = 0  # Reset counter when data arrives
                 
-                # Update state machine (this updates vel_cmd and locomotion_enabled)
-                self.update_state(controller)
+                # Process retargeting first to get current qpos for state machine
+                qpos = None
+                if smplx_data is not None:
+                    qpos = self.process_retargeting(smplx_data)
+                
+                # Update state machine with current qpos for interpolation
+                self.update_state(controller, qpos)
                 
                 # Print live status (replacing line)
                 self._print_status(controller, smplx_data)
-                
-                # ALWAYS send velocity commands if in teleop mode (regardless of smplx_data)
-                # This ensures joystick control works even without body tracking
-                if self.state == "teleop":
-                    # Send velocity commands immediately after updating state
-                    # This ensures they're sent every loop iteration
-                    self._send_velocity_command_only()
                 
                 # Auto-transition from idle to preview when data arrives
                 if self.state == "idle" and smplx_data is not None:
                     self.state = "preview"
                     print("\n→ PREVIEW mode: Pico data received!")
                 
-                # Process retargeting if we have data
-                if smplx_data is not None:
-                    qpos = self.process_retargeting(smplx_data)
-                    
-                    # Skip if no valid qpos yet
-                    if qpos is None:
-                        continue
+                # Send velocity commands if in teleop states
+                if self._is_teleop_state():
+                    self._send_velocity_command_only()
+                
+                # Process visualization and Redis sending
+                if qpos is not None:
+                    # Apply interpolation if active
+                    if self.is_interpolating:
+                        qpos = self._get_interpolated_qpos(qpos)
+                    elif self.state == "paused":
+                        # In paused, legs are at standing pose
+                        qpos[7:7+12] = self.DEFAULT_STANDING_LEGS
+                    elif self.state == "teleop_full":
+                        # In teleop_full, use GMR tracking for ENTIRE body (legs + upper)
+                        # qpos is already set from GMR, no override needed
+                        pass
+                    elif self.state == "teleop_loco":
+                        # In locomotion mode: legs + waist at LocoMode default, ARMS TRACK from GMR
+                        qpos[7:7+12] = self.loco_policy.default_angles_reorder[:12]  # Legs
+                        qpos[7+12:7+15] = self.loco_policy.default_angles_reorder[12:15]  # Waist
+                        # Arms (7+15:7+29) keep GMR tracking from qpos
                     
                     # Update MuJoCo visualization
                     self.data.qpos[:] = qpos
@@ -750,6 +1002,9 @@ class HybridLocoTeleop:
                     mimic_obs = extract_mimic_obs(qpos, self.last_qpos, dt=1/self.args.target_fps)
                     self.last_qpos = qpos.copy()
                     
+                    # Apply smooth filtering to reduce jitter
+                    mimic_obs = self.apply_smooth(mimic_obs)
+                    
                     # Get neck data
                     neck_data = None
                     try:
@@ -758,14 +1013,13 @@ class HybridLocoTeleop:
                     except:
                         pass
                     
-                    # Send to Redis if in teleop mode
-                    if self.state == "teleop":
+                    # Send to Redis if in teleop states
+                    if self._is_teleop_state():
                         self.send_to_redis(mimic_obs, neck_data)
                 else:
-                    # Even if no smplx_data, send velocity commands if in teleop mode
-                    # This ensures joystick control works even without body tracking
-                    if self.state == "teleop":
-                        self.send_to_redis(None, None)  # Send only velocity commands
+                    # Even if no smplx_data, send state info if in teleop mode
+                    if self._is_teleop_state():
+                        self.send_to_redis(None, None)
                 
                 viewer.sync()
                 rate.sleep()
@@ -780,6 +1034,17 @@ def parse_args():
     parser.add_argument("--redis_ip", type=str, default="localhost")
     parser.add_argument("--target_fps", type=int, default=50)
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose setup output")
+    parser.add_argument(
+        "--smooth",
+        action="store_true",
+        help="Enable smooth filtering for mimic observations to reduce jitter.",
+    )
+    parser.add_argument(
+        "--smooth_window_size",
+        type=int,
+        default=5,
+        help="Window size for sliding window smoothing (default: 5 frames).",
+    )
     return parser.parse_args()
 
 
