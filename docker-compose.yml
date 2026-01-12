@@ -49,6 +49,9 @@ services:
       - ${XDG_RUNTIME_DIR:-/run/user/1000}/pulse/native:${XDG_RUNTIME_DIR:-/run/user/1000}/pulse/native
       - ~/.config/pulse/cookie:/root/.config/pulse/cookie:ro
 
+      # SSH keys for robot access
+      - ~/.ssh:/root/.ssh:ro
+
       # ❌ REMOVE THIS (it broke the container)
       # - /usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:ro
 
@@ -60,5 +63,5 @@ services:
     stdin_open: true
 
     entrypoint: /bin/bash
-    command: -c "redis-server --daemonize yes && source /opt/miniconda3/etc/profile.d/conda.sh && conda activate twist2 && tail -f /dev/null"
+    command: -c "redis-server --bind 0.0.0.0 --protected-mode no --daemonize yes && source /opt/miniconda3/etc/profile.d/conda.sh && conda activate twist2 && tail -f /dev/null"
 

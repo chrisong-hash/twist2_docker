@@ -2,6 +2,21 @@
 
 # Teleoperation script with Inspire Hand support
 # This script runs the teleoperation system with trigger-based Inspire hand control
+# Auto-starts XRoboToolkit PC Service if not running
+
+echo "=============================================="
+echo "  TWIST2 Teleop with Inspire Hands"
+echo "=============================================="
+
+# Check XRoboToolkit PC Service (informational only - don't block)
+# Note: Process may run under different names (XRoboToolkit, xrobotoolkit-pc-service, etc.)
+if pgrep -f -i "xrobo" > /dev/null 2>&1; then
+    echo "[✓] XRoboToolkit PC Service detected"
+else
+    echo "[!] XRoboToolkit PC Service may not be running"
+    echo "    If PICO connection fails, start it from Applications menu"
+    echo ""
+fi
 
 # Make sure Redis is running
 redis-cli ping > /dev/null 2>&1
@@ -10,6 +25,8 @@ if [ $? -ne 0 ]; then
     redis-server --daemonize yes
     sleep 1
 fi
+echo "[✓] Redis ready"
+echo ""
 
 # Navigate to deployment directory
 cd "$(dirname "$0")/deploy_real" || exit 1

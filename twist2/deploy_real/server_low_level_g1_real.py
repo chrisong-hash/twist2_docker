@@ -335,6 +335,12 @@ class RealTimePolicyController(object):
         print("[SAFETY] Press B button on Pico controller for emergency shutdown.")
         
         loop_count = 0
+        
+        # Signal to teleop that sim2real is ready - this arms physical Inspire hands
+        if self.redis_client:
+            self.redis_client.set("sim2real_ready", "1")
+            print("[SIM2REAL] Set sim2real_ready=1 - Inspire hands armed")
+
         try:
             while True:
                 t_start = time.time()
@@ -402,10 +408,19 @@ class RealTimePolicyController(object):
                 for key in keys:
                     self.redis_pipeline.get(key)
                 redis_results = self.redis_pipeline.execute()
+                
+                # Check if teleop data is available (keys may not exist yet)
+                if redis_results[0] is None:
+                    # No teleop data yet, skip this iteration
+                    elapsed = time.time() - t_start
+                    if elapsed < self.control_dt:
+                        time.sleep(self.control_dt - elapsed)
+                    continue
+                
                 action_mimic = json.loads(redis_results[0])
-                action_hand_left = json.loads(redis_results[1])
-                action_hand_right = json.loads(redis_results[2])
-                action_neck = json.loads(redis_results[3])
+                action_hand_left = json.loads(redis_results[1]) if redis_results[1] else [0.0] * 7
+                action_hand_right = json.loads(redis_results[2]) if redis_results[2] else [0.0] * 7
+                action_neck = json.loads(redis_results[3]) if redis_results[3] else [0.0, 0.0]
                 
                 # Apply smoothing to body actions if enabled
                 if self.body_smoother is not None:
@@ -569,11 +584,18 @@ class RealTimePolicyController(object):
                     self.proprio_recordings.append(proprio_data)
                 
 
+        except KeyboardInterrupt:
+            print("\nCtrl+C pressed, shutting down...")
         except Exception as e:
             print(f"Error in main loop: {e}")
             import traceback
             traceback.print_exc()
         finally:
+            # Clear sim2real_ready flag - this disarms physical Inspire hands
+            if self.redis_client:
+                self.redis_client.delete("sim2real_ready")
+                print("[SIM2REAL] Cleared sim2real_ready - Inspire hands disarmed")
+            
             if self.record_proprio and self.proprio_recordings:
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 filename = f'logs/twist2_real_recordings_{timestamp}.json'

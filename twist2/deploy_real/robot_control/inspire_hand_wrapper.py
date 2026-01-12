@@ -40,7 +40,7 @@ class InspireHandController:
     # Async constants
     MAX_QUEUE_SIZE = 10
     
-    def __init__(self, ip, port=PORT, timeout=TIMEOUT, async_mode=True):
+    def __init__(self, ip, port=PORT, timeout=TIMEOUT, async_mode=True, verbose=False):
         """
         Initialize Inspire Hand controller
         
@@ -49,13 +49,16 @@ class InspireHandController:
             port: Modbus TCP port (default 6000)
             timeout: Socket timeout in seconds
             async_mode: If True, commands are queued and sent in background thread
+            verbose: If True, print all errors (default: only first error)
         """
         self.ip = ip
         self.port = port
         self.timeout = timeout
         self.async_mode = async_mode
+        self.verbose = verbose
         self.sock = None
         self.transaction_id = 0
+        self._connect_error_printed = False
         
         # Async mode
         self.command_queue = queue.Queue(maxsize=self.MAX_QUEUE_SIZE)
@@ -92,7 +95,8 @@ class InspireHandController:
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"[ASYNC ERROR] Hand {self.ip}: {e}")
+                if self.verbose:
+                    print(f"[ASYNC ERROR] Hand {self.ip}: {e}")
                 self.disconnect()
     
     def _connect(self):
@@ -103,9 +107,12 @@ class InspireHandController:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(self.timeout)
             self.sock.connect((self.ip, self.port))
+            self._connect_error_printed = False  # Reset on successful connect
             return True
         except socket.error as e:
-            print(f"[ERROR] Failed to connect to {self.ip}:{self.port} - {e}")
+            if self.verbose or not self._connect_error_printed:
+                print(f"[ERROR] Failed to connect to {self.ip}:{self.port} - {e}")
+                self._connect_error_printed = True
             self.sock = None
             return False
     
@@ -139,7 +146,8 @@ class InspireHandController:
                 self.command_queue.put((function_code, start_address, data))
                 return True
             except Exception as e:
-                print(f"[ERROR] Failed to queue command: {e}")
+                if self.verbose:
+                    print(f"[ERROR] Failed to queue command: {e}")
                 return False
         else:
             # Blocking mode - send immediately
@@ -199,7 +207,8 @@ class InspireHandController:
                 self.sock = None
             
             if len(response) < 8:
-                print(f"[ERROR] Response too short: {len(response)} bytes")
+                if self.verbose:
+                    print(f"[ERROR] Response too short: {len(response)} bytes")
                 return None
             
             # Parse response
@@ -207,22 +216,26 @@ class InspireHandController:
             resp_func_code = response[7]
             
             if resp_func_code & 0x80:
-                error_code = response[8] if len(response) > 8 else 0
-                print(f"[ERROR] Modbus exception: function={resp_func_code & 0x7F}, error={error_code}")
+                if self.verbose:
+                    error_code = response[8] if len(response) > 8 else 0
+                    print(f"[ERROR] Modbus exception: function={resp_func_code & 0x7F}, error={error_code}")
                 return None
             
             return response[7:]  # Return PDU only
             
         except socket.timeout:
-            print(f"[ERROR] Communication timeout with {self.ip}")
+            if self.verbose:
+                print(f"[ERROR] Communication timeout with {self.ip}")
             self.disconnect()
             return None
         except socket.error as e:
-            print(f"[ERROR] Socket error with {self.ip}: {e}")
+            if self.verbose:
+                print(f"[ERROR] Socket error with {self.ip}: {e}")
             self.disconnect()
             return None
         except Exception as e:
-            print(f"[ERROR] Unexpected error: {e}")
+            if self.verbose:
+                print(f"[ERROR] Unexpected error: {e}")
             self.disconnect()
             return None
     
