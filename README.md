@@ -123,6 +123,77 @@ kps: [150, 150, 150, 200, 60, 60,  # left leg (increase for more power)
 action_scale: 0.75  # increase for more aggressive movements
 ```
 
+## Neck Control (Dynamixel)
+
+The robot uses two Dynamixel XL330-M288-T motors for neck control (yaw and pitch), connected via U2D2 adapter.
+
+### Hardware Setup
+
+1. Connect U2D2 to robot's USB port
+2. Motor IDs: **Yaw = 0**, **Pitch = 1**
+3. Baud rate: **57600** (or 2Mbps if configured)
+
+### Deploy to Robot
+
+From the PC, copy the peripheral scripts to the robot:
+
+```bash
+cd twist2/robot_deploy
+./deploy_to_robot.sh 192.168.123.164
+```
+
+### Manual Neck Control on Robot
+
+```bash
+# SSH to robot
+ssh unitree@192.168.123.164
+
+# Grant serial port access (required after each boot)
+sudo chmod 666 /dev/ttyUSB0
+
+# Read current motor positions (for calibration)
+python3 read_neck_position.py
+
+# Run peripherals manually (video + neck)
+python3 robot_peripherals.py --redis 192.168.123.222
+
+# Or use the wrapper script
+./run_peripherals.sh
+```
+
+### Calibration
+
+To find your neck center position:
+
+1. Manually position the neck to look straight ahead
+2. Run `python3 read_neck_position.py` on the robot
+3. Note the YAW and PITCH values
+4. Update the defaults in `run_peripherals.sh` or use env vars:
+
+```bash
+YAW_CENTER=1338 PITCH_CENTER=695 ./run_peripherals.sh
+```
+
+### Automatic Startup (via sim2real_peripheral.sh)
+
+The `sim2real_peripheral.sh` script automatically:
+- SSHs to the robot and starts `robot_peripherals.py`
+- Runs the RL policy on PC
+- Cleans up peripherals when you Ctrl+C
+
+```bash
+cd twist2
+bash sim2real_peripheral.sh
+```
+
+### Troubleshooting
+
+- **Motor not responding**: Check `/dev/ttyUSB0` exists and has write permission
+- **Wrong direction**: Pitch is inverted in software; yaw follows head direction
+- **Motor error (red LED)**: Script auto-reboots motors on startup
+
+**Full documentation:** See [twist2/doc/TWIST2_NECK.md](twist2/doc/TWIST2_NECK.md)
+
 ## Directory Structure
 
 ```
@@ -137,13 +208,20 @@ twist2_docker/
 └── twist2/                # TWIST2 source code
     ├── assets/
     │   └── ckpts/         # Pretrained checkpoints
-    ├── deploy_real/       # Real robot deployment
+    ├── deploy_real/       # Real robot deployment (PC-side)
     │   ├── robot_control/ # Robot control modules
-    │   └── xrobot_teleop_to_robot_w_hand.py
+    │   └── xrobot_teleop_inspire.py
+    ├── robot_deploy/      # Robot deployment (robot-side)
+    │   ├── robot_peripherals.py  # ZED video + neck control
+    │   ├── read_neck_position.py # Calibration helper
+    │   ├── run_peripherals.sh    # Startup wrapper
+    │   ├── reset_zed_usb.sh      # USB reset for ZED issues
+    │   └── deploy_to_robot.sh    # Copy files to robot
     ├── legged_gym/        # Training environments
     ├── rsl_rl/            # RL algorithms
-    ├── teleop.sh          # Teleoperation script
-    ├── sim2real.sh        # Real robot low-level controller
+    ├── teleop_inspire.sh  # Teleoperation with Inspire hands
+    ├── sim2real_peripheral.sh # RL + auto-peripheral management
+    ├── sim2real.sh        # RL policy only (legacy)
     ├── sim2sim.sh         # Simulation test
     └── train.sh           # Training script
 ```
