@@ -11,7 +11,17 @@ PC_IP="192.168.123.222"  # PC IP as seen from robot (for Redis)
 NET_INTERFACE="enp4s0"
 
 # SSH options (use identity file, skip host key check for convenience)
-SSH_OPTS="-i ~/.ssh/id_robot -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5"
+# Try workspace key first (Docker), then home directory key (host)
+SCRIPT_DIR=$(dirname $(realpath $0))
+if [ -f "${SCRIPT_DIR}/robot_deploy/id_robot" ]; then
+    SSH_KEY="${SCRIPT_DIR}/robot_deploy/id_robot"
+elif [ -f ~/.ssh/id_robot ]; then
+    SSH_KEY=~/.ssh/id_robot
+else
+    echo "[ERROR] SSH key not found! Copy id_robot to twist2/robot_deploy/ or ~/.ssh/"
+    exit 1
+fi
+SSH_OPTS="-i ${SSH_KEY} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5"
 
 # ============================================
 
