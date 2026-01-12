@@ -190,24 +190,20 @@ class StateMachine:
             new_position = min(1.0, self.hand_right_position + self.hand_movement_step)
             if new_position != self.hand_right_position:
                 self.hand_right_position = new_position
-                print(f"Right hand closing: {self.hand_right_position:.1f}")
         elif right_grip_current:  # Open right hand
             new_position = max(0.0, self.hand_right_position - self.hand_movement_step)
             if new_position != self.hand_right_position:
                 self.hand_right_position = new_position
-                print(f"Right hand opening: {self.hand_right_position:.1f}")
         
         # Left hand control
         if left_index_trig_current:  # Close left hand
             new_position = min(1.0, self.hand_left_position + self.hand_movement_step)
             if new_position != self.hand_left_position:
                 self.hand_left_position = new_position
-                print(f"Left hand closing: {self.hand_left_position:.1f}")
         elif left_grip_current:  # Open left hand
             new_position = max(0.0, self.hand_left_position - self.hand_movement_step)
             if new_position != self.hand_left_position:
                 self.hand_left_position = new_position
-                print(f"Left hand opening: {self.hand_left_position:.1f}")
         
         # Extract velocity commands from controller axes
         self._update_velocity_commands(controller_data)
@@ -392,13 +388,14 @@ class XRobotTeleopToRobot:
         self.video_writer = None
         self.renderer = None
         
-        # FPS monitoring
+        # FPS monitoring (disabled by default to reduce console spam)
         self.fps_monitor = FPSMonitor(
             enable_detailed_stats=args.measure_fps,
             quick_print_interval=100,
             detailed_print_interval=1000,
             expected_fps=self.target_fps,
-            name="Teleop Loop"
+            name="Teleop Loop",
+            enable_quick_print=False  # Disabled to reduce spam
         )
         
         # Inspire hands

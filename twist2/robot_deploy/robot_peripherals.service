@@ -1,0 +1,16 @@
+[Unit]
+Description=TWIST2 Robot Peripherals (Video + Neck)
+After=network.target
+
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=/home/unitree
+Environment=REDIS_HOST=192.168.50.164
+ExecStart=/usr/bin/python3 /home/unitree/robot_peripherals.py --redis ${REDIS_HOST} --yaw_center 1338 --pitch_center 695
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+

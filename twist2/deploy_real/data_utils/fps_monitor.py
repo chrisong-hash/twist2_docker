@@ -20,7 +20,8 @@ class FPSMonitor:
                  quick_print_interval=100,
                  detailed_print_interval=1000,
                  expected_fps=None,
-                 name="Loop"):
+                 name="Loop",
+                 enable_quick_print=True):
         """
         Initialize FPS monitor.
         
@@ -30,8 +31,10 @@ class FPSMonitor:
             detailed_print_interval: Print detailed stats every M steps (if enabled)
             expected_fps: Expected FPS for comparison (optional)
             name: Name of the loop being monitored (for logging)
+            enable_quick_print: Whether to print quick stats (default True)
         """
         self.enable_detailed_stats = enable_detailed_stats
+        self.enable_quick_print = enable_quick_print
         self.quick_print_interval = quick_print_interval
         self.detailed_print_interval = detailed_print_interval
         self.expected_fps = expected_fps
@@ -62,7 +65,7 @@ class FPSMonitor:
             self.step_count += 1
             
             # Print quick stats
-            if self.step_count % self.quick_print_interval == 0:
+            if self.enable_quick_print and self.step_count % self.quick_print_interval == 0:
                 self._print_quick_stats()
             
             # Track and print detailed stats if enabled
