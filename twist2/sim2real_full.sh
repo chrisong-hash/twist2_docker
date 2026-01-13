@@ -1,67 +1,135 @@
 #!/bin/bash
-# TWIST2 Full Robot Control - runs sim2real + video + neck
+# TWIST2 Full Sim2Real - Hybrid locomotion + Peripherals (video + neck)
+# 
+# This script:
+#   1. SSHes to robot to start peripherals (video streaming + neck control)
+#   2. Runs hybrid locomotion mode with Inspire hands
+#   3. Cleans up on exit
+#
+# Use with: hybrid_teleop.sh (or teleop_inspire.sh for non-hybrid)
+
+# ============== Configuration ==============
+ROBOT_USER="unitree"
+ROBOT_IP="192.168.123.164"
+PC_IP="192.168.123.222"  # PC IP as seen from robot (for Redis)
+
+# Network interface connecting to robot
+NET_INTERFACE="enp4s0"
+
+# SSH options
+SCRIPT_DIR=$(dirname $(realpath $0))
+if [ -f "${SCRIPT_DIR}/robot_deploy/id_robot" ]; then
+    SSH_KEY="${SCRIPT_DIR}/robot_deploy/id_robot"
+elif [ -f ~/.ssh/id_robot ]; then
+    SSH_KEY=~/.ssh/id_robot
+else
+    echo "[ERROR] SSH key not found! Copy id_robot to twist2/robot_deploy/ or ~/.ssh/"
+    exit 1
+fi
+SSH_OPTS="-i ${SSH_KEY} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5"
+
+# ============================================
+
+echo "=============================================="
+echo "  TWIST2 Full Sim2Real"
+echo "  (Hybrid Locomotion + Video + Neck)"
+echo "=============================================="
+echo "  Robot:     ${ROBOT_USER}@${ROBOT_IP}"
+echo "  PC Redis:  ${PC_IP}"
+echo "  Network:   ${NET_INTERFACE}"
+echo "=============================================="
+echo ""
+echo "Controls:"
+echo "  Right A        : preview → teleop → pause → teleop..."
+echo "  Left X         : Toggle teleop_full ↔ teleop_loco"
+echo "  Right A+B      : EMERGENCY SHUTDOWN"
+echo "  Joysticks      : Walk/rotate (in teleop_loco mode)"
+echo "  Triggers/Grips : Inspire hand control"
+echo "=============================================="
+echo ""
 
 # Activate conda environment
-source ~/miniconda3/bin/activate twist2
+if [ -f "/opt/conda/etc/profile.d/conda.sh" ]; then
+    source /opt/conda/etc/profile.d/conda.sh
+    conda activate twist2 2>/dev/null || true
+elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+    source $HOME/miniconda3/etc/profile.d/conda.sh
+    conda activate twist2
+fi
 
-SCRIPT_DIR=$(dirname $(realpath $0))
-ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_1017_20k.onnx
+CKPT_PATH=${SCRIPT_DIR}/assets/ckpts/twist2_1017_20k.onnx
 
-# Network interface that connects to robot internal network
-net=enp4s0
+# Function to start peripherals on robot
+start_peripherals() {
+    echo "[1/3] Starting peripherals on robot..."
+    
+    # Create logs directory on robot if it doesn't exist
+    echo "    Creating logs directory..."
+    ssh -n ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} 'mkdir -p ~/logs' || { echo "[✗] Cannot connect to robot"; exit 1; }
+    
+    # Kill any existing peripheral process
+    echo "    Killing existing processes..."
+    ssh -n ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} 'pkill -f robot_peripherals.py 2>/dev/null; exit 0'
+    sleep 1
+    
+    # Start peripherals with logging
+    echo "    Launching peripheral script (video + neck)..."
+    LOG_FILE="peripheral_\$(date +%Y%m%d_%H%M%S).log"
+    ssh -f ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} "cd ~ && python3 robot_peripherals.py --redis ${PC_IP} > ~/logs/${LOG_FILE} 2>&1"
+    
+    sleep 3
+    
+    # Verify it started
+    echo "    Verifying..."
+    if ssh -n ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} 'pgrep -f robot_peripherals.py' > /dev/null 2>&1; then
+        echo "[✓] Peripherals started (video + neck active)"
+    else
+        echo "[✗] Failed to start peripherals! Check robot manually."
+        echo "    ssh unitree@${ROBOT_IP} 'cat ~/logs/peripheral_*.log | tail -20'"
+    fi
+}
 
-# Redis server (PC IP where teleop runs)
-REDIS_HOST=${REDIS_HOST:-192.168.50.164}
+# Function to stop peripherals on robot
+stop_peripherals() {
+    echo ""
+    echo "[3/3] Stopping peripherals on robot..."
+    ssh -n ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} 'pkill -f robot_peripherals.py 2>/dev/null; exit 0' || true
+    echo "[✓] Peripherals stopped"
+}
 
-# Neck calibration - ADJUST THESE FOR YOUR ASSEMBLY
-YAW_CENTER=${YAW_CENTER:-2048}
-PITCH_CENTER=${PITCH_CENTER:-2048}
+# Cleanup function - called on exit
+cleanup() {
+    echo ""
+    echo "=============================================="
+    echo "  Shutting down..."
+    echo "=============================================="
+    stop_peripherals
+    echo ""
+    echo "To view peripheral logs:"
+    echo "  ssh ${ROBOT_USER}@${ROBOT_IP} 'ls -lt ~/logs/ | head'"
+}
 
-# Dynamixel device
-DYNAMIXEL_DEV=${DYNAMIXEL_DEV:-/dev/ttyUSB0}
+# Register cleanup on script exit
+trap cleanup EXIT
 
+# Clear stale Redis keys from previous sessions
+echo "Clearing stale Redis keys..."
+redis-cli DEL teleop_state_info loco_vel_cmd sim2real_ready > /dev/null 2>&1
+echo "Redis keys cleared."
+echo ""
+
+# Start peripherals
+start_peripherals
+
+# Run the RL policy with hybrid locomotion mode
+echo ""
+echo "[2/3] Starting hybrid locomotion mode..."
 echo "=============================================="
-echo "  TWIST2 Full Robot Control"
-echo "=============================================="
-echo "  Redis:        $REDIS_HOST"
-echo "  Yaw center:   $YAW_CENTER"
-echo "  Pitch center: $PITCH_CENTER"
-echo "  Dynamixel:    $DYNAMIXEL_DEV"
-echo "=============================================="
-
 cd ${SCRIPT_DIR}/deploy_real
 
-# Start peripherals (video + neck) in background
-echo ""
-echo "🚀 Starting peripherals (video + neck)..."
-python robot_peripherals.py \
-    --redis ${REDIS_HOST} \
-    --yaw_center ${YAW_CENTER} \
-    --pitch_center ${PITCH_CENTER} \
-    --device ${DYNAMIXEL_DEV} &
-
-PERIPHERALS_PID=$!
-echo "   Peripherals PID: $PERIPHERALS_PID"
-
-# Give peripherals time to initialize
-sleep 2
-
-# Start main robot control
-echo ""
-echo "🤖 Starting main robot control..."
 python server_low_level_g1_real.py \
-    --policy ${ckpt_path} \
-    --net ${net} \
+    --policy ${CKPT_PATH} \
+    --net ${NET_INTERFACE} \
     --device cuda \
-    --use_hand \
+    --hybrid_loco_mode \
     --smooth_body 0.5
-
-# When main control exits, stop peripherals
-echo ""
-echo "🛑 Stopping peripherals..."
-kill $PERIPHERALS_PID 2>/dev/null
-wait $PERIPHERALS_PID 2>/dev/null
-
-echo "Done."
-
-

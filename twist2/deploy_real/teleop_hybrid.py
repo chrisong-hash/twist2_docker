@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-Hybrid Locomotion + Teleoperation System v2
-============================================
-Improved state machine with smooth transitions and latching controls.
+Hybrid Teleop - Full Robot Control
+==================================
+Complete teleop system with hybrid locomotion, neck tracking, and Inspire hands.
 
 States:
   idle        : Waiting for Pico VR data
   preview     : MuJoCo shows your motion (calibrate here)
   teleop_full : Full body teleop (TWIST2 controls all joints)
   teleop_loco : Locomotion mode (LocoMode legs + GMR upper body)
-  paused      : Robot holds current pose
+  paused      : Robot FREEZES (ignores motion until unpaused)
 
 Controls:
   Right A (key_one)  : Cycle: preview → teleop → pause → teleop → pause...
   Left X (key_one)   : Toggle teleop_full ↔ teleop_loco (only in teleop mode)
-  B button (key_two) : EMERGENCY SHUTDOWN (stops teleop + robot server)
+  Right A+B together : EMERGENCY SHUTDOWN (stops teleop + robot server)
   Left joystick      : Walk (in teleop_loco mode)
   Right joystick     : Rotate (in teleop_loco mode)
-  Triggers/Grips     : Hand control (for Inspire hands)
+  Left Trigger       : Close left Inspire hand
+  Right Trigger      : Close right Inspire hand
+  Left Grip          : Open left Inspire hand
+  Right Grip         : Open right Inspire hand
 
 All mode transitions have smooth 1-second interpolation.
 """
@@ -190,6 +193,7 @@ from general_motion_retargeting import human_head_to_robot_neck
 
 from data_utils.params import DEFAULT_MIMIC_OBS
 from data_utils.rot_utils import euler_from_quaternion_np, quat_diff_np, quat_rotate_inverse_np
+from robot_control.inspire_hand_wrapper import DualHandController
 
 
 class LocoModePolicy:
@@ -327,7 +331,7 @@ class HybridLocoTeleop:
       preview     : MuJoCo shows your motion (calibrate here)
       teleop_full : Full body teleop (TWIST2 controls all joints)
       teleop_loco : Locomotion mode (LocoMode legs + GMR upper body)
-      paused      : Robot holds default standing pose
+      paused      : Robot FREEZES at current pose (ignores your motion)
     
     All mode transitions use 1-second interpolation for smooth motion.
     """
@@ -348,6 +352,7 @@ class HybridLocoTeleop:
         # State machine - valid states: idle, preview, teleop_full, teleop_loco, paused, exit
         self.state = "idle"
         self.previous_teleop_state = "teleop_full"  # Remember which teleop state to return to from pause
+        self.paused_qpos = None  # Frozen pose for paused state
         self.vel_cmd = np.zeros(3, dtype=np.float32)
         
         # Interpolation state
@@ -361,7 +366,14 @@ class HybridLocoTeleop:
         # Button state tracking (for edge detection)
         self._right_key_was_pressed = False
         self._left_key_was_pressed = False
-        self._b_key_was_pressed = False
+        self._emergency_was_pressed = False
+        
+        # Inspire hand state
+        self.use_inspire_hands = getattr(args, 'use_inspire_hands', False)
+        self.inspire_hand_controller = None
+        self.hand_left_position = 0.0   # 0.0 = open, 1.0 = closed
+        self.hand_right_position = 0.0
+        self.hand_movement_step = 0.05  # 5% per frame when held
         
         # Height setting
         self.estimated_height = args.actual_human_height
@@ -373,12 +385,13 @@ class HybridLocoTeleop:
         self.smooth_history = []  # Store recent observations for sliding window
         
         # Initialize systems
-        print("\n[cyan]Initializing Hybrid Locomotion + Teleoperation v2...[/cyan]")
+        print("\n[cyan]Initializing Hybrid Teleop...[/cyan]")
         self._setup_locomotion_policy()
         self._setup_teleop_streamer()
         self._setup_retargeting()  # Initialize GMR with default height
         self._setup_mujoco()
         self._setup_redis()
+        self._setup_inspire_hands()
         
         print("\n[green]Systems initialized![/green]")
         if self.enable_smooth:
@@ -389,12 +402,12 @@ class HybridLocoTeleop:
     
     def _setup_locomotion_policy(self):
         """Load RoboMimic locomotion policy"""
-        print("\n[1/5] Loading locomotion policy...")
+        print("\n[1/6] Loading locomotion policy...")
         self.loco_policy = LocoModePolicy()
     
     def _setup_teleop_streamer(self):
         """Initialize Pico VR connection via XRobotStreamer"""
-        print("\n[2/5] Connecting to Pico VR...")
+        print("\n[2/6] Connecting to Pico VR...")
         try:
             self.teleop_streamer = XRobotStreamer()
             print("[green]XRobotStreamer initialized - waiting for Pico data[/green]")
@@ -410,7 +423,7 @@ class HybridLocoTeleop:
     
     def _setup_retargeting(self, height=None):
         """Initialize GMR for upper body retargeting with given height"""
-        print("\n[3/5] Setting up GMR retargeting...")
+        print("\n[3/6] Setting up GMR retargeting...")
         if height is None:
             height = self.estimated_height
         
@@ -430,7 +443,7 @@ class HybridLocoTeleop:
     
     def _setup_mujoco(self):
         """Setup MuJoCo simulation for preview"""
-        print("\n[4/5] Setting up MuJoCo preview...")
+        print("\n[4/6] Setting up MuJoCo preview...")
         xml_path = str(ROBOT_XML_DICT["unitree_g1"])
         self.model = mj.MjModel.from_xml_path(xml_path)
         self.data = mj.MjData(self.model)
@@ -445,13 +458,90 @@ class HybridLocoTeleop:
     
     def _setup_redis(self):
         """Setup Redis connection for robot communication"""
-        print("\n[5/5] Connecting to Redis...")
+        print("\n[5/6] Connecting to Redis...")
         self.redis_client = redis.Redis(host=self.args.redis_ip, port=6379, db=0)
         self.redis_pipeline = self.redis_client.pipeline()
         self.redis_client.ping()
         # Clear any previous shutdown signal
         self.redis_client.delete("robot_shutdown")
         print("[green]Redis connected[/green]")
+    
+    def _setup_inspire_hands(self):
+        """Setup Inspire hands if enabled"""
+        if not self.use_inspire_hands:
+            print("\n[6/6] Inspire hands: DISABLED")
+            return
+        
+        print("\n[6/6] Setting up Inspire hands...")
+        try:
+            left_ip = getattr(self.args, 'inspire_left_ip', '192.168.123.210')
+            right_ip = getattr(self.args, 'inspire_right_ip', '192.168.123.211')
+            
+            print(f"    Connecting: Left={left_ip}, Right={right_ip}")
+            
+            self.inspire_hand_controller = DualHandController(
+                left_ip=left_ip,
+                right_ip=right_ip,
+                timeout=3.0
+            )
+            
+            # Open both hands initially
+            time.sleep(0.5)
+            self.inspire_hand_controller.open_both()
+            print("[green]Inspire hands connected and initialized[/green]")
+            
+        except Exception as e:
+            print(f"[red]Failed to initialize Inspire hands: {e}[/red]")
+            self.inspire_hand_controller = None
+            self.use_inspire_hands = False
+    
+    def _control_inspire_hands(self, controller_data):
+        """Control Inspire hands based on trigger/grip state"""
+        if not self.use_inspire_hands or self.inspire_hand_controller is None:
+            return
+        
+        if controller_data is None:
+            return
+        
+        right_ctrl = controller_data.get("RightController", {})
+        left_ctrl = controller_data.get("LeftController", {})
+        
+        # Get trigger and grip values
+        right_trig = right_ctrl.get("index_trig", 0)
+        left_trig = left_ctrl.get("index_trig", 0)
+        right_grip = right_ctrl.get("grip", 0)
+        left_grip = left_ctrl.get("grip", 0)
+        
+        # Convert bool to float if needed
+        if isinstance(right_trig, bool):
+            right_trig = 1.0 if right_trig else 0.0
+        if isinstance(left_trig, bool):
+            left_trig = 1.0 if left_trig else 0.0
+        if isinstance(right_grip, bool):
+            right_grip = 1.0 if right_grip else 0.0
+        if isinstance(left_grip, bool):
+            left_grip = 1.0 if left_grip else 0.0
+        
+        # Right hand control: trigger=close, grip=open
+        if right_trig > 0.5:
+            self.hand_right_position = min(1.0, self.hand_right_position + self.hand_movement_step)
+        elif right_grip > 0.5:
+            self.hand_right_position = max(0.0, self.hand_right_position - self.hand_movement_step)
+        
+        # Left hand control: trigger=close, grip=open
+        if left_trig > 0.5:
+            self.hand_left_position = min(1.0, self.hand_left_position + self.hand_movement_step)
+        elif left_grip > 0.5:
+            self.hand_left_position = max(0.0, self.hand_left_position - self.hand_movement_step)
+        
+        try:
+            # Inspire hands: 0.0=open, 1.0=closed (invert our convention)
+            left_inspire_pos = 1.0 - self.hand_left_position
+            right_inspire_pos = 1.0 - self.hand_right_position
+            
+            self.inspire_hand_controller.ctrl_dual_hand(left_inspire_pos, right_inspire_pos)
+        except Exception as e:
+            print(f"[red]Inspire hand error: {e}[/red]")
     
     def _send_shutdown_signal(self):
         """Send shutdown signal to robot server via Redis"""
@@ -464,21 +554,23 @@ class HybridLocoTeleop:
     
     def _print_controls(self):
         print("\n" + "="*60)
-        print("  HYBRID LOCOMOTION + TELEOPERATION v2")
+        print("  HYBRID TELEOP - Full Robot Control")
         print("="*60)
         print("\n[yellow]Controls:[/yellow]")
         print("  Right A            : Cycle preview → teleop → pause → teleop...")
         print("  Left X             : Toggle teleop_full ↔ teleop_loco")
-        print("  [red]B button        : EMERGENCY SHUTDOWN[/red]")
+        print("  [red]Right A+B       : EMERGENCY SHUTDOWN[/red]")
         print("  Left joystick      : Walk (only in teleop_loco)")
         print("  Right joystick     : Rotate (only in teleop_loco)")
-        print("  Triggers/Grips     : Hand control (Inspire hands)")
+        if self.use_inspire_hands:
+            print("  [cyan]Triggers         : Close hands[/cyan]")
+            print("  [cyan]Grips            : Open hands[/cyan]")
         print("\n[yellow]States:[/yellow]")
         print("  idle        : Waiting for Pico data")
         print("  preview     : MuJoCo preview (calibrate here)")
         print("  teleop_full : Full body teleop (default)")
         print("  teleop_loco : Locomotion mode (legs walk, upper tracks)")
-        print("  paused      : Robot holds current pose")
+        print("  paused      : Robot FREEZES (ignores motion until unpaused)")
         print("\n[cyan]Workflow:[/cyan]")
         print("  1. Connect Pico via XRobotToolkit → auto enters preview")
         print("  2. Calibrate until MuJoCo reflects your motion")
@@ -525,9 +617,9 @@ class HybridLocoTeleop:
         self.interp_target_qpos = self.interp_start_qpos.copy()
         
         if to_state == "paused":
-            # Target: default standing pose for all joints
-            self.interp_target_qpos[7:7+12] = self.DEFAULT_STANDING_LEGS
-            # Keep upper body at current position (will be overwritten if we have retarget data)
+            # Target: FREEZE at the current pose (captured in self.paused_qpos)
+            # interp_target_qpos = interp_start_qpos (no change - just hold position)
+            pass
         elif to_state == "teleop_full":
             # Target: current retargeted pose (full body from GMR)
             # In teleop_full, entire body tracks - no override needed
@@ -555,12 +647,11 @@ class HybridLocoTeleop:
         alpha = alpha * alpha * alpha * (alpha * (6 * alpha - 15) + 10)
         
         # Update target position with current data (if available)
-        if current_target_qpos is not None:
+        # EXCEPT for paused state - keep the frozen target
+        if current_target_qpos is not None and self.interp_to_state != "paused":
             self.interp_target_qpos = current_target_qpos.copy()
             # Apply state-specific poses
-            if self.interp_to_state == "paused":
-                self.interp_target_qpos[7:7+12] = self.DEFAULT_STANDING_LEGS
-            elif self.interp_to_state == "teleop_full":
+            if self.interp_to_state == "teleop_full":
                 # In teleop_full, entire body tracks GMR - no override needed
                 pass
             elif self.interp_to_state == "teleop_loco":
@@ -601,49 +692,63 @@ class HybridLocoTeleop:
         right_key_two = right_ctrl.get("key_two", False)  # Right B
         left_key_two = left_ctrl.get("key_two", False)    # Left Y button
         
+        # DEBUG: Show raw button states every 2 seconds
+        if not hasattr(self, '_btn_debug_time'):
+            self._btn_debug_time = 0
+        if time.time() - self._btn_debug_time > 2.0:
+            print(f"\n[DEBUG BTN] RA:{right_key_one} LX:{left_key_one} RB:{right_key_two} LY:{left_key_two}")
+            self._btn_debug_time = time.time()
+        
         # Detect button presses (rising edge)
         right_a_pressed = right_key_one and not self._right_key_was_pressed
         left_x_pressed = left_key_one and not self._left_key_was_pressed
-        b_pressed = (right_key_two or left_key_two) and not self._b_key_was_pressed
         
-        # B button - always exit (even during interpolation)
-        # Also sends shutdown signal to robot server for safety
-        if b_pressed:
+        # Emergency stop: A+B on right controller (both pressed together)
+        a_plus_b_pressed = right_key_one and right_key_two
+        if a_plus_b_pressed and not self._emergency_was_pressed:
             self.state = "exit"
-            print("\n[red]→ EMERGENCY SHUTDOWN requested (B button)[/red]")
+            print("\n[red]→ EMERGENCY SHUTDOWN requested (A+B)[/red]")
             print("[red]  Sending shutdown signal to robot server...[/red]")
             self._send_shutdown_signal()
+        self._emergency_was_pressed = a_plus_b_pressed
         
         # Process other buttons only if not interpolating
         if not self.is_interpolating and self.state != "exit":
             
             # Right A - cycle: preview → teleop_full → pause → teleop_full → pause...
             if right_a_pressed:
+                print(f"\n[yellow]Right A pressed in state: {self.state}[/yellow]")
                 if self.state == "idle":
                     self.state = "preview"
-                    print("\n[cyan]→ PREVIEW mode: MuJoCo shows your motion[/cyan]")
+                    print("[cyan]→ PREVIEW mode: MuJoCo shows your motion[/cyan]")
                 elif self.state == "preview":
                     # Enter teleop_full by default (with interpolation)
+                    print("[cyan]→ Starting TELEOP_FULL[/cyan]")
                     self._start_interpolation("preview", "teleop_full", current_qpos)
                 elif self.state in ["teleop_full", "teleop_loco"]:
-                    # Go to pause (remember current teleop mode)
+                    # Go to pause (remember current teleop mode and freeze current pose)
                     self.previous_teleop_state = self.state
+                    self.paused_qpos = current_qpos.copy()  # Freeze the current pose
+                    print(f"[cyan]→ PAUSING (robot freezes at current pose)[/cyan]")
                     self._start_interpolation(self.state, "paused", current_qpos)
                 elif self.state == "paused":
                     # Return to previous teleop state (with interpolation)
+                    print(f"[cyan]→ UNPAUSING to {self.previous_teleop_state}[/cyan]")
                     self._start_interpolation("paused", self.previous_teleop_state, current_qpos)
             
             # Left X - toggle teleop_full ↔ teleop_loco (only when in teleop mode)
             if left_x_pressed:
+                print(f"\n[yellow]Left X pressed in state: {self.state}[/yellow]")
                 if self.state == "teleop_full":
+                    print("[cyan]→ Switching to TELEOP_LOCO (walking mode)[/cyan]")
                     self._start_interpolation("teleop_full", "teleop_loco", current_qpos)
                 elif self.state == "teleop_loco":
+                    print("[cyan]→ Switching to TELEOP_FULL[/cyan]")
                     self._start_interpolation("teleop_loco", "teleop_full", current_qpos)
         
         # Update button state tracking
         self._right_key_was_pressed = right_key_one
         self._left_key_was_pressed = left_key_one
-        self._b_key_was_pressed = right_key_two or left_key_two
         
         # Joystick for locomotion - only active in teleop_loco
         left_axis = left_ctrl.get("axis", [0, 0])
@@ -791,7 +896,7 @@ class HybridLocoTeleop:
         """Send observations to Redis for sim2real"""
         if mimic_obs is not None:
             self.redis_pipeline.set(
-                "action_body_unitree_g1_with_hands", 
+                "action_body_unitree_g1_with_hands",
                 json.dumps(mimic_obs.tolist())
             )
         
@@ -800,6 +905,12 @@ class HybridLocoTeleop:
                 "action_neck_unitree_g1_with_hands", 
                 json.dumps(neck_data)
             )
+            # Debug: show neck data occasionally
+            if not hasattr(self, '_neck_debug_count'):
+                self._neck_debug_count = 0
+            self._neck_debug_count += 1
+            if self._neck_debug_count % 100 == 1:  # Every ~2 seconds at 50fps
+                print(f"\n[cyan]Neck: yaw={neck_data[0]:.3f}, pitch={neck_data[1]:.3f}[/cyan]")
         
         # Send velocity command based on locomotion state
         if self._is_locomotion_active():
@@ -940,6 +1051,10 @@ class HybridLocoTeleop:
                 # Update state machine with current qpos for interpolation
                 self.update_state(controller, qpos)
                 
+                # Control Inspire hands (only in teleop states, not preview)
+                if self._is_teleop_state():
+                    self._control_inspire_hands(controller)
+                
                 # Print live status (replacing line)
                 self._print_status(controller, smplx_data)
                 
@@ -958,8 +1073,12 @@ class HybridLocoTeleop:
                     if self.is_interpolating:
                         qpos = self._get_interpolated_qpos(qpos)
                     elif self.state == "paused":
-                        # In paused, legs are at standing pose
-                        qpos[7:7+12] = self.DEFAULT_STANDING_LEGS
+                        # In paused, robot FREEZES at the pose captured when entering pause
+                        if self.paused_qpos is not None:
+                            qpos = self.paused_qpos.copy()
+                        else:
+                            # Fallback: standing pose
+                            qpos[7:7+12] = self.DEFAULT_STANDING_LEGS
                     elif self.state == "teleop_full":
                         # In teleop_full, use GMR tracking for ENTIRE body (legs + upper)
                         # qpos is already set from GMR, no override needed
@@ -988,13 +1107,16 @@ class HybridLocoTeleop:
                     # Apply smooth filtering to reduce jitter
                     mimic_obs = self.apply_smooth(mimic_obs)
                     
-                    # Get neck data
+                    # Get neck data from head tracking
                     neck_data = None
                     try:
                         neck_yaw, neck_pitch = human_head_to_robot_neck(smplx_data)
-                        neck_data = [neck_yaw * 0.5, neck_pitch * 0.5]
-                    except:
-                        pass
+                        neck_data = [float(neck_yaw * 0.5), float(neck_pitch * 0.5)]
+                    except Exception as e:
+                        # Only log error once
+                        if not hasattr(self, '_neck_error_logged'):
+                            print(f"[yellow]Neck tracking error: {e}[/yellow]")
+                            self._neck_error_logged = True
                     
                     # Send to Redis if in teleop states
                     if self._is_teleop_state():
@@ -1011,7 +1133,7 @@ class HybridLocoTeleop:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Hybrid Locomotion + Teleoperation")
+    parser = argparse.ArgumentParser(description="Hybrid Teleop - Full Robot Control")
     parser.add_argument("--robot", default="unitree_g1")
     parser.add_argument("--actual_human_height", type=float, default=1.65)
     parser.add_argument("--redis_ip", type=str, default="localhost")
@@ -1027,6 +1149,24 @@ def parse_args():
         type=int,
         default=5,
         help="Window size for sliding window smoothing (default: 5 frames).",
+    )
+    # Inspire hand arguments
+    parser.add_argument(
+        "--use_inspire_hands",
+        action="store_true",
+        help="Enable Inspire hand control via triggers/grips.",
+    )
+    parser.add_argument(
+        "--inspire_left_ip",
+        type=str,
+        default="192.168.123.210",
+        help="IP address for left Inspire hand.",
+    )
+    parser.add_argument(
+        "--inspire_right_ip",
+        type=str,
+        default="192.168.123.211",
+        help="IP address for right Inspire hand.",
     )
     return parser.parse_args()
 

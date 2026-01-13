@@ -647,6 +647,12 @@ class NeckController:
                     if isinstance(neck_data, (list, tuple)) and len(neck_data) >= 2:
                         yaw, pitch = float(neck_data[0]), float(neck_data[1])
                         if abs(yaw - last_yaw) > 0.01 or abs(pitch - last_pitch) > 0.01:
+                            # Debug: show received neck commands
+                            if not hasattr(self, '_debug_count'):
+                                self._debug_count = 0
+                            self._debug_count += 1
+                            if self._debug_count % 50 == 1:  # Every ~1 second
+                                print(f"[Neck] Recv: yaw={yaw:.3f}, pitch={pitch:.3f}")
                             self.set_angles(yaw, pitch)
                             last_yaw, last_pitch = yaw, pitch
                 time.sleep(0.02)
