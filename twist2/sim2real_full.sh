@@ -131,5 +131,6 @@ python server_low_level_g1_real.py \
     --policy ${CKPT_PATH} \
     --net ${NET_INTERFACE} \
     --device cuda \
+    --use_hand \
     --hybrid_loco_mode \
     --smooth_body 0.5

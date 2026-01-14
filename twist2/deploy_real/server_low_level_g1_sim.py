@@ -401,6 +401,9 @@ class RealTimePolicyController:
         policy_execution_times = []
         policy_step_count = 0
         policy_fps_print_interval = 100
+        
+        # Initialize pd_target to default position (used by PD control every step)
+        pd_target = self.default_dof_pos.copy()
 
         try:
             for i in pbar:
@@ -465,10 +468,17 @@ class RealTimePolicyController:
                     for key in keys:
                         self.redis_pipeline.get(key)
                     redis_results = self.redis_pipeline.execute()
+                    
+                    # Check if teleop data is available (skip iteration if not)
+                    if redis_results[0] is None:
+                        # No teleop data yet, wait for hybrid_teleop.sh to start
+                        time.sleep(0.01)
+                        continue
+                    
                     action_mimic = json.loads(redis_results[0])
-                    action_left_hand = json.loads(redis_results[1])
-                    action_right_hand = json.loads(redis_results[2])
-                    action_neck = json.loads(redis_results[3])
+                    action_left_hand = json.loads(redis_results[1]) if redis_results[1] else [0.0] * 7
+                    action_right_hand = json.loads(redis_results[2]) if redis_results[2] else [0.0] * 7
+                    action_neck = json.loads(redis_results[3]) if redis_results[3] else [0.0, 0.0]
 
                     # Construct observation for TWIST2 controller
                     obs_full = np.concatenate([action_mimic, obs_proprio])

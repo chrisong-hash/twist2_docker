@@ -380,8 +380,8 @@ class HybridLocoTeleop:
         
         # Button state tracking (for edge detection and hold detection)
         self._right_a_was_pressed = False
-        self._right_b_was_pressed = False
         self._left_x_was_pressed = False
+        self._left_y_was_pressed = False
         self._ab_hold_start_time = None  # For A+B hold detection
         
         # Height setting
@@ -579,19 +579,17 @@ class HybridLocoTeleop:
         print("  HYBRID LOCOMOTION + TELEOPERATION v3")
         print("="*60)
         print("\n[yellow]Controls:[/yellow]")
-        print("  Left X             : Toggle preview ↔ teleop")
-        print("  Right A (teleop)   : Toggle upper body (tracking ↔ frozen)")
-        print("  Right B (teleop)   : Toggle lower body (standing ↔ walking)")
+        print("  Right A            : Toggle preview ↔ teleop")
+        print("  Left X (teleop)    : Toggle hands (open ↔ closed)")
+        print("  Left Y (teleop)    : Toggle walking (standing ↔ walking)")
         print("  [red]A+B (hold 1s)    : EMERGENCY SHUTDOWN[/red]")
         print("  Left joystick      : Walk direction (in walking mode)")
         print("  Right joystick     : Rotation (in walking mode)")
-        print("  Left trigger       : Open left hand")
-        print("  Right trigger      : Open right hand")
-        print("  Left grip          : Close left hand")
-        print("  Right grip         : Close right hand")
+        print("  Triggers           : Open hands")
+        print("  Grips              : Close hands")
         print("\n[yellow]States:[/yellow]")
         print("  idle    → Pico connects → preview")
-        print("  preview ↔ Left X       ↔ teleop")
+        print("  preview ↔ Right A      ↔ teleop")
         print("\n[cyan]Workflow:[/cyan]")
         print("  1. Connect Pico via XRobotToolkit → auto enters preview")
         print("  2. Calibrate until MuJoCo reflects your motion")
@@ -716,6 +714,7 @@ class HybridLocoTeleop:
         right_a = right_ctrl.get("key_one", False)  # Right A
         right_b = right_ctrl.get("key_two", False)  # Right B
         left_x = left_ctrl.get("key_one", False)    # Left X
+        left_y = left_ctrl.get("key_two", False)    # Left Y
         
         # A+B held for 1 second = EMERGENCY QUIT
         if right_a and right_b:
@@ -730,47 +729,49 @@ class HybridLocoTeleop:
         else:
             self._ab_hold_start_time = None
         
-        # Detect button presses (rising edge) - only if NOT both pressed
+        # Detect button presses (rising edge)
         right_a_pressed = right_a and not self._right_a_was_pressed and not right_b
-        right_b_pressed = right_b and not self._right_b_was_pressed and not right_a
         left_x_pressed = left_x and not self._left_x_was_pressed
+        left_y_pressed = left_y and not self._left_y_was_pressed
         
         # State transitions
         if self.state == "exit":
             pass  # No button processing in exit state
         elif self.state == "idle":
-            # Any button press starts preview
-            if right_a_pressed or right_b_pressed:
+            # A button starts preview
+            if right_a_pressed:
                 self.state = "preview"
                 print("\n[cyan]→ PREVIEW mode: Calibrate your pose[/cyan]")
         elif self.state == "preview":
-            # Left X enters teleop
-            if left_x_pressed:
+            # A enters teleop
+            if right_a_pressed:
                 self.state = "teleop"
                 self._frozen_preview_qpos = None  # Clear frozen pose when entering teleop
                 print("\n[green]→ TELEOP mode: Robot follows you![/green]")
                 self._print_pause_status()
         elif self.state == "teleop":
-            # Left X: Return to preview (robot holds current position)
-            if left_x_pressed:
+            # A: Return to preview (robot holds current position)
+            if right_a_pressed:
                 if current_qpos is not None:
                     self._frozen_preview_qpos = current_qpos.copy()
                 self.state = "preview"
                 print("\n[cyan]→ PREVIEW mode: Robot holding position[/cyan]")
-                print("  Press A or B to resume teleop")
+                print("  Press A to resume teleop")
             
-            # A toggles upper body (tracking ↔ frozen)
-            elif right_a_pressed:
-                self.upper_body_paused = not self.upper_body_paused
-                if self.upper_body_paused and current_qpos is not None:
-                    self._frozen_upper_qpos = current_qpos[7+15:7+29].copy()  # Arms
-                    print(f"\n[yellow]→ UPPER: FROZEN (arms hold position)[/yellow]")
-                else:
-                    print(f"\n[green]→ UPPER: TRACKING (arms follow you)[/green]")
-                self._print_pause_status()
+            # X toggles hands (all open ↔ all closed)
+            if left_x_pressed:
+                # Toggle both hands together
+                new_state = not self._left_hand_closed
+                self._left_hand_closed = new_state
+                self._right_hand_closed = new_state
+                state_str = "CLOSED" if new_state else "OPEN"
+                print(f"\n[cyan]→ HANDS: {state_str}[/cyan]")
+                if self.hand_controller:
+                    pos = 1.0 if new_state else 0.0
+                    self.hand_controller.ctrl_dual_hand(pos, pos)
             
-            # B toggles lower body (standing ↔ walking)
-            elif right_b_pressed:
+            # Y toggles lower body (standing ↔ walking)
+            if left_y_pressed:
                 self.locomotion_active = not self.locomotion_active
                 if self.locomotion_active:
                     print(f"\n[cyan]→ LOWER: WALKING (joystick locomotion)[/cyan]")
@@ -780,8 +781,8 @@ class HybridLocoTeleop:
         
         # Update button state tracking
         self._right_a_was_pressed = right_a
-        self._right_b_was_pressed = right_b
         self._left_x_was_pressed = left_x
+        self._left_y_was_pressed = left_y
         
         # Joystick for locomotion - only active when locomotion_active
         left_axis = left_ctrl.get("axis", [0, 0])

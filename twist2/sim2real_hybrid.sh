@@ -3,7 +3,15 @@
 #
 # Use this with hybrid_teleop.sh to enable joystick walking!
 
-source ~/miniconda3/bin/activate twist2
+# Activate conda environment (flexible path for Docker/host)
+if [ -f "/opt/conda/etc/profile.d/conda.sh" ]; then
+    source /opt/conda/etc/profile.d/conda.sh
+    conda activate twist2 2>/dev/null || true
+elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+    source $HOME/miniconda3/etc/profile.d/conda.sh
+    conda activate twist2
+fi
+# If already in twist2 env (e.g., Docker), continue
 
 SCRIPT_DIR=$(dirname $(realpath $0))
 ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_1017_20k.onnx

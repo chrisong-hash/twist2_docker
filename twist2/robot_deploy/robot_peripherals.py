@@ -70,8 +70,8 @@ DEVICENAME = '/dev/ttyUSB0'
 BAUDRATE = 57600
 ID_YAW = 0
 ID_PITCH = 1
-DEFAULT_YAW_CENTER = 1338
-DEFAULT_PITCH_CENTER = 695
+DEFAULT_YAW_CENTER = 1122
+DEFAULT_PITCH_CENTER = 1685
 
 # Dynamixel addresses
 ADDR_TORQUE_ENABLE = 64
@@ -81,11 +81,15 @@ ADDR_PRESENT_POSITION = 132
 ADDR_PROFILE_VELOCITY = 112
 ADDR_HARDWARE_ERROR = 70
 PROTOCOL_VERSION = 2.0
-# Position limits (from physical calibration)
-YAW_MIN = 514
-YAW_MAX = 2095
-PITCH_MIN = 588
-PITCH_MAX = 1626
+# Movement range from center (in position units, ~0.088 deg each)
+YAW_RANGE = 792    # ±792 from center (~70 degrees each way, symmetric)
+PITCH_RANGE = 500  # ±500 from center (~44 degrees each way)
+
+# Absolute physical limits (safety clamps)
+YAW_ABS_MIN = 330
+YAW_ABS_MAX = 1970
+PITCH_ABS_MIN = 1630
+PITCH_ABS_MAX = 2667
 
 # ============== Globals ==============
 running = True
@@ -547,12 +551,24 @@ class NeckController:
         if not self.connected:
             return
         
+        # Calculate dynamic limits from center
+        yaw_min = self.yaw_center - YAW_RANGE
+        yaw_max = self.yaw_center + YAW_RANGE
+        pitch_min = self.pitch_center - PITCH_RANGE
+        pitch_max = self.pitch_center + PITCH_RANGE
+        
         positions_per_rad = 4096 / (2 * math.pi)
-        yaw_pos = max(YAW_MIN, min(YAW_MAX, 
-                      self.yaw_center + int(yaw_rad * positions_per_rad)))
+        yaw_pos = self.yaw_center + int(yaw_rad * positions_per_rad)
         # Invert pitch direction (negative pitch_rad = look down = motor position increases)
-        pitch_pos = max(PITCH_MIN, min(PITCH_MAX,
-                        self.pitch_center - int(pitch_rad * positions_per_rad)))
+        pitch_pos = self.pitch_center - int(pitch_rad * positions_per_rad)
+        
+        # Apply dynamic range limits
+        yaw_pos = max(yaw_min, min(yaw_max, yaw_pos))
+        pitch_pos = max(pitch_min, min(pitch_max, pitch_pos))
+        
+        # Apply absolute physical limits (safety)
+        yaw_pos = max(YAW_ABS_MIN, min(YAW_ABS_MAX, yaw_pos))
+        pitch_pos = max(PITCH_ABS_MIN, min(PITCH_ABS_MAX, pitch_pos))
         
         # Write to YAW motor with error checking
         yaw_result, yaw_err = self.packet_handler.write4ByteTxRx(self.port_handler, ID_YAW, ADDR_GOAL_POSITION, yaw_pos)
