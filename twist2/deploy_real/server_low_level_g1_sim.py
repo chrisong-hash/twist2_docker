@@ -54,8 +54,15 @@ def get_gravity_orientation_from_quat(quaternion):
     return gravity_orientation
 
 
+try:
+    from gear_wbc_policy import GearWbcPolicy
+except ImportError:
+    GearWbcPolicy = None
+    print("[HYBRID] Warning: GearWbcPolicy not available")
+
+
 class LocoModePolicy:
-    """RoboMimic LocoMode policy for leg locomotion (same as server_low_level_g1_real.py)"""
+    """RoboMimic LocoMode policy for leg locomotion (DEPRECATED - use GearWbcPolicy instead)"""
     
     def __init__(self, policy_dir="/workspace/RoboMimic_Deploy/policy/loco_mode"):
         config_path = os.path.join(policy_dir, "config", "LocoMode.yaml")
@@ -216,14 +223,23 @@ class RealTimePolicyController:
         self.loco_policy = None
         
         if hybrid_loco_mode:
-            print("[HYBRID] TEST MODE: Full RoboMimic control (all 29 joints) when walking")
+            print("[HYBRID] Using GROOT GearWBC policy for stable locomotion")
             try:
-                self.loco_policy = LocoModePolicy()
-                print("[HYBRID] LocoMode policy loaded successfully")
+                if GearWbcPolicy is not None:
+                    self.loco_policy = GearWbcPolicy()
+                    self.use_gear_wbc = True
+                    print("[HYBRID] GearWBC policy loaded successfully")
+                else:
+                    # Fallback to RoboMimic LocoMode
+                    print("[HYBRID] GearWBC not available, falling back to LocoMode")
+                    self.loco_policy = LocoModePolicy()
+                    self.use_gear_wbc = False
+                    print("[HYBRID] LocoMode policy loaded successfully")
             except Exception as e:
-                print(f"[HYBRID] Failed to load LocoMode policy: {e}")
+                print(f"[HYBRID] Failed to load locomotion policy: {e}")
                 print("[HYBRID] Continuing without hybrid mode...")
                 self.hybrid_loco_mode = False
+                self.use_gear_wbc = False
         
         self.policy = load_onnx_policy(policy_path, device)
 
@@ -524,21 +540,21 @@ class RealTimePolicyController:
                         startup_grace_seconds = 3.0  # Use TWIST2 for first 3 seconds
                         in_startup_grace = (time.time() - self._startup_time) < startup_grace_seconds
                         
-                        # Read teleop state from Redis (hybrid_loco_teleop.py sends effective state)
+                        # Read teleop state from Redis
                         teleop_state_str = self.redis_client.get("teleop_state_info")
-                        teleop_state = "teleop_full"  # Default to full teleop
+                        teleop_state = "teleop_full"  # Default
+                        locomotion_active = False
+                        
                         if teleop_state_str:
                             try:
                                 state_info = json.loads(teleop_state_str)
-                                # "state" field now contains effective state (target during interpolation)
+                                locomotion_active = state_info.get("locomotion_active", False)
                                 teleop_state = state_info.get("state", "teleop_full")
                             except Exception as e:
                                 pass
                         
-                        # ONLY use LocoMode if explicitly in teleop_loco state
-                        # All other states (paused, idle, preview, teleop_full, startup) use TWIST2
-                        # Also force TWIST2 during startup grace period
-                        use_locomode = (teleop_state == "teleop_loco") and not in_startup_grace
+                        # Use locomotion policy if locomotion_active OR state == "teleop_loco"
+                        use_locomode = (locomotion_active or teleop_state == "teleop_loco") and not in_startup_grace
                         
                         # ===== SERVER-SIDE INTERPOLATION FOR SMOOTH MODE TRANSITIONS =====
                         # Initialize interpolation state if not exists
@@ -557,7 +573,8 @@ class RealTimePolicyController:
                             self._mode_interp_start_target = dof_pos.copy()  # Start from current robot position
                             if use_locomode:
                                 self.loco_policy.reset()
-                                print(f"\n[HYBRID] Starting smooth transition → LocoMode (1.0s)")
+                                policy_name = "GearWBC" if getattr(self, 'use_gear_wbc', False) else "LocoMode"
+                                print(f"\n[HYBRID] Starting smooth transition → {policy_name} (1.0s)")
                             else:
                                 print(f"\n[HYBRID] Starting smooth transition → TWIST2 (1.0s)")
                         self._was_in_locomode = use_locomode
@@ -567,32 +584,52 @@ class RealTimePolicyController:
                             if not hasattr(self, '_last_teleop_state') or self._last_teleop_state != teleop_state or \
                                (in_startup_grace and not hasattr(self, '_printed_startup_msg')):
                                 grace_msg = " (startup grace - forcing TWIST2)" if in_startup_grace else ""
-                                print(f"[HYBRID] Teleop state: {teleop_state} → {'LocoMode' if use_locomode else 'TWIST2'}{grace_msg}")
+                                policy_name = "GearWBC" if getattr(self, 'use_gear_wbc', False) else "LocoMode"
+                                print(f"[HYBRID] Teleop state: {teleop_state} → {policy_name if use_locomode else 'TWIST2'}{grace_msg}")
                                 self._last_teleop_state = teleop_state
                                 if in_startup_grace:
                                     self._printed_startup_msg = True
                         
                         # Compute target for current mode
                         if use_locomode:
-                            # LOCOMOTION MODE: Use LocoMode for legs
-                            gravity_ori = get_gravity_orientation_from_quat(quat)
+                            # LOCOMOTION MODE: Use GearWBC or LocoMode for lower body
                             if vel_cmd is None:
                                 vel_cmd = np.zeros(3, dtype=np.float32)
                             
-                            loco_action, loco_kps, loco_kds = self.loco_policy.compute(
-                                dof_pos, dof_vel, ang_vel, gravity_ori, vel_cmd
-                            )
+                            if getattr(self, 'use_gear_wbc', False):
+                                # GearWBC: takes quat directly, outputs 15 DOF (legs + waist)
+                                # Also supports torso_rpy for compensation (pass None for now)
+                                loco_action, loco_kps, loco_kds = self.loco_policy.compute(
+                                    dof_pos, dof_vel, ang_vel, quat, vel_cmd, torso_rpy=None
+                                )
+                                
+                                # GearWBC target: legs + waist from policy, arms FROZEN
+                                mode_target = pd_target.copy()
+                                mode_target[:15] = loco_action[:15]  # Legs + waist from GearWBC
+                                # Arms stay at frozen position
+                                if hasattr(self, '_frozen_arm_pos'):
+                                    mode_target[15:29] = self._frozen_arm_pos
+                            else:
+                                # LocoMode fallback: takes gravity_ori, outputs 12 DOF (legs only)
+                                gravity_ori = get_gravity_orientation_from_quat(quat)
+                                loco_action, loco_kps, loco_kds = self.loco_policy.compute(
+                                    dof_pos, dof_vel, ang_vel, gravity_ori, vel_cmd
+                                )
+                                
+                                # LocoMode target: legs from policy, waist at default
+                                mode_target = pd_target.copy()
+                                mode_target[:12] = loco_action[:12]
+                                mode_target[12:15] = self.loco_policy.default_angles_reorder[12:15]
+                                if hasattr(self, '_frozen_arm_pos'):
+                                    mode_target[15:29] = self._frozen_arm_pos
                             
-                            # LocoMode target: legs from policy, waist at default, ARMS TRACK from TWIST2
-                            mode_target = pd_target.copy()
-                            mode_target[:12] = loco_action[:12]           # Legs from LocoMode
-                            mode_target[12:15] = self.loco_policy.default_angles_reorder[12:15]  # Waist at default
-                            # Arms (15-28) keep TWIST2 tracking output from pd_target
-                            
-                            # Store LocoMode PD gains
-                            self.loco_kps = loco_kps.copy()
-                            self.loco_kds = loco_kds.copy()
-                            for i in range(12, 29):
+                            # Store locomotion PD gains (use full 29 DOF gains)
+                            self.loco_kps = np.zeros(29, dtype=np.float32)
+                            self.loco_kds = np.zeros(29, dtype=np.float32)
+                            self.loco_kps[:len(loco_kps)] = loco_kps
+                            self.loco_kds[:len(loco_kds)] = loco_kds
+                            # Use config gains for upper body
+                            for i in range(15, 29):
                                 self.loco_kps[i] = self.stiffness[i]
                                 self.loco_kds[i] = self.damping[i]
                         else:
