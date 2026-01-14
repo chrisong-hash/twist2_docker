@@ -44,4 +44,4 @@ Miniconda*.sh
 # Pip cache for Docker builds
 pip_cache/
 
-.cursorrules
+.cursorrulestwist2/robot_deploy/id_robot
