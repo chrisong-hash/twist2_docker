@@ -230,6 +230,17 @@ RUN wget -q https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip 
     unzip vosk-model-small-en-us-0.15.zip && \
     rm vosk-model-small-en-us-0.15.zip
 
+# Install voice recognition packages (vosk + sounddevice) in gmr env
+WORKDIR /workspace
+RUN source /opt/miniconda3/etc/profile.d/conda.sh && \
+    conda activate gmr && \
+    pip install vosk sounddevice
+
+# Download vosk speech recognition model
+RUN wget -q https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip && \
+    unzip vosk-model-small-en-us-0.15.zip && \
+    rm vosk-model-small-en-us-0.15.zip
+
 # Auto-activate twist2 environment in bashrc
 RUN echo 'source /opt/miniconda3/etc/profile.d/conda.sh' >> /root/.bashrc && \
     echo 'conda activate twist2' >> /root/.bashrc && \
