@@ -1,26 +1,38 @@
 #!/usr/bin/env python3
 """
-Hybrid Teleop - Full Robot Control
-==================================
-Complete teleop system with hybrid locomotion, neck tracking, and Inspire hands.
+Hybrid Teleop - Combo Button Controls
+=====================================
+Complete teleop with hybrid locomotion, neck tracking, and Inspire hands.
+
+COMBO BUTTON MAPPING:
+====================
+SYSTEM CONTROLS (Right A = modifier):
+  Right A (release)  : Cycle preview → teleop → pause (recalibrates on unpause)
+  Right A + Left X   : Toggle UPPER BODY (arms+hands) freeze
+  Right A + Left Y   : Toggle WALK ↔ BALANCE mode
+  Right A+B          : EMERGENCY SHUTDOWN
+
+FINGER CONTROL (X/Y + Trigger):
+  Left X + Trigger   : Open fingers (whichever hand's trigger)
+  Left Y + Trigger   : Close fingers (per-hand)
+
+THUMB CONTROL (X/Y + Grip):
+  Left X + Grip      : Thumb outward (per-hand)
+  Left Y + Grip      : Thumb inward (per-hand)
+
+LOCOMOTION:
+  Left joystick      : Walk (in walk mode)
+  Right joystick     : Rotate (in walk mode)
 
 States:
-  idle        : Waiting for Pico VR data
-  preview     : MuJoCo shows your motion (calibrate here)
-  teleop_full : Full body teleop (TWIST2 controls all joints)
-  teleop_loco : Locomotion mode (LocoMode legs + GMR upper body)
-  paused      : Robot FREEZES (ignores motion until unpaused)
+  teleop_full : Balance mode (full body tracking)
+  teleop_loco : Walk mode (legs walk, arms track)
+  paused      : Robot FREEZES at current pose
 
-Controls:
-  Right A (key_one)  : Cycle: preview → teleop → pause → teleop → pause...
-  Left X (key_one)   : Toggle teleop_full ↔ teleop_loco (only in teleop mode)
-  Right A+B together : EMERGENCY SHUTDOWN (stops teleop + robot server)
-  Left joystick      : Walk (in teleop_loco mode)
-  Right joystick     : Rotate (in teleop_loco mode)
-  Left Trigger       : Close left Inspire hand
-  Right Trigger      : Close right Inspire hand
-  Left Grip          : Open left Inspire hand
-  Right Grip         : Open right Inspire hand
+KEY BEHAVIOR:
+  - Arms are ABSOLUTE: preview arm pose = teleop arm pose
+  - Body orientation is RELATIVE: user can reposition without robot jumping
+  - Pause/unpause recalibrates body orientation (not arms)
 
 All mode transitions have smooth 1-second interpolation.
 """
@@ -345,6 +357,16 @@ class HybridLocoTeleop:
         -0.2, 0.0, 0.0, 0.42, -0.23, 0.0,  # right leg
     ], dtype=np.float32)
     
+    # Default standing pose for ALL joints (from DEFAULT_MIMIC_OBS_G1)
+    # This is the pose robot should start in when entering teleop
+    DEFAULT_STANDING_JOINTS = np.array([
+        -0.2, 0.0, 0.0, 0.4, -0.2, 0.0,     # left leg (6)
+        -0.2, 0.0, 0.0, 0.4, -0.2, 0.0,     # right leg (6)
+        0.0, 0.0, 0.0,                       # torso (3)
+        0.0, 0.4, 0.0, 1.2, 0.0, 0.0, 0.0,  # left arm (7) - bent elbow
+        0.0, -0.4, 0.0, 1.2, 0.0, 0.0, 0.0, # right arm (7) - bent elbow
+    ], dtype=np.float32)
+    
     def __init__(self, args):
         self.args = args
         self.robot_name = "unitree_g1"
@@ -364,16 +386,31 @@ class HybridLocoTeleop:
         self.interp_to_state = None     # State we're transitioning to
         
         # Button state tracking (for edge detection)
-        self._right_key_was_pressed = False
-        self._left_key_was_pressed = False
+        self._right_a_held = False
+        self._right_a_used_as_modifier = False
+        self._prev_right_a = False
+        self._prev_left_x = False
+        self._prev_left_y = False
+        self._prev_right_trig = False
+        self._prev_left_trig = False
+        self._prev_right_grip = False
+        self._prev_left_grip = False
         self._emergency_was_pressed = False
+        
+        # Upper body freeze state (arms + hands)
+        self.hands_paused = False  # When True, arms+hands freeze at last position
+        self.frozen_arm_obs = None  # Stored arm positions when freezing
+        self._capture_frozen_arms = False  # Flag to capture arm positions on next frame
         
         # Inspire hand state
         self.use_inspire_hands = getattr(args, 'use_inspire_hands', False)
         self.inspire_hand_controller = None
         self.hand_left_position = 0.0   # 0.0 = open, 1.0 = closed
         self.hand_right_position = 0.0
+        self.thumb_left_rotation = 0.5  # 0.0 = outward, 0.5 = neutral, 1.0 = inward
+        self.thumb_right_rotation = 0.5
         self.hand_movement_step = 0.05  # 5% per frame when held
+        self.thumb_movement_step = 0.03  # 3% per frame for thumb
         
         # Height setting
         self.estimated_height = args.actual_human_height
@@ -383,6 +420,12 @@ class HybridLocoTeleop:
         self.enable_smooth = args.smooth
         self.smooth_window_size = args.smooth_window_size
         self.smooth_history = []  # Store recent observations for sliding window
+        
+        # Calibration offset system - when entering teleop, store user's pose as "zero reference"
+        # Robot movements are relative to this calibration, not absolute
+        self.calibration_mimic_obs = None  # User's pose when entering teleop
+        self.use_calibration_offset = True  # Enable calibration offset mode
+        self._needs_calibration = False  # Flag to capture calibration on next frame
         
         # Initialize systems
         print("\n[cyan]Initializing Hybrid Teleop...[/cyan]")
@@ -496,50 +539,32 @@ class HybridLocoTeleop:
             self.use_inspire_hands = False
     
     def _control_inspire_hands(self, controller_data):
-        """Control Inspire hands based on trigger/grip state"""
+        """Control Inspire hands based on combo button state
+        
+        Finger/thumb control is handled in update_state via combos:
+        - X + Trigger = open fingers
+        - Y + Trigger = close fingers
+        - X + Grip = thumb outward
+        - Y + Grip = thumb inward
+        
+        This method just sends the current state to the Inspire hands.
+        """
         if not self.use_inspire_hands or self.inspire_hand_controller is None:
             return
         
-        if controller_data is None:
+        # Skip if hands are paused
+        if self.hands_paused:
             return
-        
-        right_ctrl = controller_data.get("RightController", {})
-        left_ctrl = controller_data.get("LeftController", {})
-        
-        # Get trigger and grip values
-        right_trig = right_ctrl.get("index_trig", 0)
-        left_trig = left_ctrl.get("index_trig", 0)
-        right_grip = right_ctrl.get("grip", 0)
-        left_grip = left_ctrl.get("grip", 0)
-        
-        # Convert bool to float if needed
-        if isinstance(right_trig, bool):
-            right_trig = 1.0 if right_trig else 0.0
-        if isinstance(left_trig, bool):
-            left_trig = 1.0 if left_trig else 0.0
-        if isinstance(right_grip, bool):
-            right_grip = 1.0 if right_grip else 0.0
-        if isinstance(left_grip, bool):
-            left_grip = 1.0 if left_grip else 0.0
-        
-        # Right hand control: trigger=close, grip=open
-        if right_trig > 0.5:
-            self.hand_right_position = min(1.0, self.hand_right_position + self.hand_movement_step)
-        elif right_grip > 0.5:
-            self.hand_right_position = max(0.0, self.hand_right_position - self.hand_movement_step)
-        
-        # Left hand control: trigger=close, grip=open
-        if left_trig > 0.5:
-            self.hand_left_position = min(1.0, self.hand_left_position + self.hand_movement_step)
-        elif left_grip > 0.5:
-            self.hand_left_position = max(0.0, self.hand_left_position - self.hand_movement_step)
         
         try:
             # Inspire hands: 0.0=open, 1.0=closed (invert our convention)
             left_inspire_pos = 1.0 - self.hand_left_position
             right_inspire_pos = 1.0 - self.hand_right_position
             
-            self.inspire_hand_controller.ctrl_dual_hand(left_inspire_pos, right_inspire_pos)
+            self.inspire_hand_controller.ctrl_dual_hand(
+                left_inspire_pos, right_inspire_pos,
+                self.thumb_left_rotation, self.thumb_right_rotation
+            )
         except Exception as e:
             print(f"[red]Inspire hand error: {e}[/red]")
     
@@ -554,32 +579,30 @@ class HybridLocoTeleop:
     
     def _print_controls(self):
         print("\n" + "="*60)
-        print("  HYBRID TELEOP - Full Robot Control")
+        print("  HYBRID TELEOP - Combo Button Controls")
         print("="*60)
-        print("\n[yellow]Controls:[/yellow]")
-        print("  Right A            : Cycle preview → teleop → pause → teleop...")
-        print("  Left X             : Toggle teleop_full ↔ teleop_loco")
+        print("\n[yellow]SYSTEM CONTROLS (Right A = modifier):[/yellow]")
+        print("  Right A (release)  : Cycle preview → teleop → pause")
+        print("  Right A + Left X   : Toggle UPPER BODY (arms+hands) freeze")
+        print("  Right A + Left Y   : Toggle WALK ↔ BALANCE mode")
         print("  [red]Right A+B       : EMERGENCY SHUTDOWN[/red]")
-        print("  Left joystick      : Walk (only in teleop_loco)")
-        print("  Right joystick     : Rotate (only in teleop_loco)")
-        if self.use_inspire_hands:
-            print("  [cyan]Triggers         : Close hands[/cyan]")
-            print("  [cyan]Grips            : Open hands[/cyan]")
-        print("\n[yellow]States:[/yellow]")
-        print("  idle        : Waiting for Pico data")
-        print("  preview     : MuJoCo preview (calibrate here)")
-        print("  teleop_full : Full body teleop (default)")
-        print("  teleop_loco : Locomotion mode (legs walk, upper tracks)")
-        print("  paused      : Robot FREEZES (ignores motion until unpaused)")
-        print("\n[cyan]Workflow:[/cyan]")
-        print("  1. Connect Pico via XRobotToolkit → auto enters preview")
-        print("  2. Calibrate until MuJoCo reflects your motion")
-        print("  3. Press Right A → enters teleop_full")
-        print("  4. Press Left X → switches to teleop_loco (walking mode)")
-        print("  5. Use joysticks to walk in teleop_loco")
-        print("  6. Press Left X again → back to teleop_full")
-        print("  7. Press Right A → pause, Right A again → unpause")
-        print("\n[cyan]Note:[/cyan] All transitions have 1-second smooth interpolation")
+        print("\n[yellow]FINGER CONTROL (X/Y + Trigger):[/yellow]")
+        print("  Left X + Trigger   : Open fingers (per-hand)")
+        print("  Left Y + Trigger   : Close fingers (per-hand)")
+        print("\n[yellow]THUMB CONTROL (X/Y + Grip):[/yellow]")
+        print("  Left X + Grip      : Thumb outward (per-hand)")
+        print("  Left Y + Grip      : Thumb inward (per-hand)")
+        print("\n[yellow]LOCOMOTION:[/yellow]")
+        print("  Left joystick      : Walk (in walk mode)")
+        print("  Right joystick     : Rotate (in walk mode)")
+        print("\n[cyan]States:[/cyan]")
+        print("  teleop_full : Balance mode (full body tracking)")
+        print("  teleop_loco : Walk mode (legs walk, arms track)")
+        print("  paused      : Robot FREEZES at current pose")
+        print("\n[cyan]Key behavior:[/cyan]")
+        print("  - Arms are ABSOLUTE (preview pose = teleop pose)")
+        print("  - Body orientation is RELATIVE (can reposition)")
+        print("  - Pause/unpause recalibrates body orientation")
         print("="*60 + "\n")
     
     def get_teleop_data(self):
@@ -612,6 +635,17 @@ class HybridLocoTeleop:
         else:
             # Use MuJoCo's current qpos as fallback
             self.interp_start_qpos = self.data.qpos.copy()
+        
+        # Special case: preview → teleop_full
+        # Robot should START at DEFAULT standing pose and interpolate TO tracking
+        # This matches original TWIST2 behavior (idle → teleop interpolates from default)
+        if from_state == "preview" and to_state == "teleop_full":
+            # Set starting pose to default standing (arms bent, legs spread)
+            self.interp_start_qpos[7:7+29] = self.DEFAULT_STANDING_JOINTS
+            # Target will be updated each frame with current tracking data
+            self.interp_target_qpos = current_qpos.copy() if current_qpos is not None else self.interp_start_qpos.copy()
+            print(f"\n[cyan]→ Interpolating: {from_state} → {to_state} (from DEFAULT pose, 1.0s)[/cyan]")
+            return
         
         # Determine target position based on target state
         self.interp_target_qpos = self.interp_start_qpos.copy()
@@ -674,6 +708,16 @@ class HybridLocoTeleop:
     def update_state(self, controller_data, current_qpos=None):
         """Update state machine based on controller input
         
+        NEW COMBO BUTTON MAPPING:
+        - Right A (release, if not used as modifier): Cycle states
+        - Right A + Left X: Toggle hand pause
+        - Right A + Left Y: Toggle leg pause
+        - Left X + trigger: Open fingers (per-hand)
+        - Left Y + trigger: Close fingers (per-hand)
+        - Left X + grip: Thumb outward (per-hand)
+        - Left Y + grip: Thumb inward (per-hand)
+        - Right A+B: Emergency shutdown
+        
         Args:
             controller_data: Dict with RightController and LeftController data
             current_qpos: Current robot qpos for interpolation (optional)
@@ -681,87 +725,148 @@ class HybridLocoTeleop:
         if controller_data is None:
             return
         
-        # Don't process button inputs during interpolation (except exit)
-        # Controller data has nested structure: {'RightController': {...}, 'LeftController': {...}}
         right_ctrl = controller_data.get("RightController", {})
         left_ctrl = controller_data.get("LeftController", {})
         
         # Get current button states
-        right_key_one = right_ctrl.get("key_one", False)  # Right A
-        left_key_one = left_ctrl.get("key_one", False)    # Left X button
-        right_key_two = right_ctrl.get("key_two", False)  # Right B
-        left_key_two = left_ctrl.get("key_two", False)    # Left Y button
+        right_a = right_ctrl.get("key_one", False)   # Right A
+        right_b = right_ctrl.get("key_two", False)   # Right B
+        left_x = left_ctrl.get("key_one", False)     # Left X
+        left_y = left_ctrl.get("key_two", False)     # Left Y
         
-        # DEBUG: Show raw button states every 2 seconds
-        if not hasattr(self, '_btn_debug_time'):
-            self._btn_debug_time = 0
-        if time.time() - self._btn_debug_time > 2.0:
-            print(f"\n[DEBUG BTN] RA:{right_key_one} LX:{left_key_one} RB:{right_key_two} LY:{left_key_two}")
-            self._btn_debug_time = time.time()
+        right_trig = right_ctrl.get("index_trig", False)
+        left_trig = left_ctrl.get("index_trig", False)
+        right_grip = right_ctrl.get("grip", False)
+        left_grip = left_ctrl.get("grip", False)
         
-        # Detect button presses (rising edge)
-        right_a_pressed = right_key_one and not self._right_key_was_pressed
-        left_x_pressed = left_key_one and not self._left_key_was_pressed
+        # Convert bool to float if needed for triggers/grips
+        if isinstance(right_trig, bool):
+            right_trig = 1.0 if right_trig else 0.0
+        if isinstance(left_trig, bool):
+            left_trig = 1.0 if left_trig else 0.0
+        if isinstance(right_grip, bool):
+            right_grip = 1.0 if right_grip else 0.0
+        if isinstance(left_grip, bool):
+            left_grip = 1.0 if left_grip else 0.0
         
-        # Emergency stop: A+B on right controller (both pressed together)
-        a_plus_b_pressed = right_key_one and right_key_two
-        if a_plus_b_pressed and not self._emergency_was_pressed:
+        # Thresholds for analog inputs
+        right_trig_active = right_trig > 0.5
+        left_trig_active = left_trig > 0.5
+        right_grip_active = right_grip > 0.5
+        left_grip_active = left_grip > 0.5
+        
+        # ===== Emergency Stop (A+B) =====
+        a_plus_b = right_a and right_b
+        if a_plus_b and not self._emergency_was_pressed:
             self.state = "exit"
             print("\n[red]→ EMERGENCY SHUTDOWN requested (A+B)[/red]")
-            print("[red]  Sending shutdown signal to robot server...[/red]")
             self._send_shutdown_signal()
-        self._emergency_was_pressed = a_plus_b_pressed
+        self._emergency_was_pressed = a_plus_b
         
-        # Process other buttons only if not interpolating
-        if not self.is_interpolating and self.state != "exit":
+        # ===== A Button Modifier Logic =====
+        # On A press: start tracking
+        if right_a and not self._prev_right_a:
+            self._right_a_held = True
+            self._right_a_used_as_modifier = False
+        
+        # While A is held, check for combos (only if not interpolating)
+        if self._right_a_held and not self.is_interpolating and self.state != "exit":
+            # A + X = toggle upper body (arms+hands) tracking ↔ frozen
+            if left_x and not self._prev_left_x:
+                self._right_a_used_as_modifier = True
+                self.hands_paused = not self.hands_paused
+                if self.hands_paused:
+                    # Store current arm positions to freeze at
+                    # Will be captured in the main loop when mimic_obs is available
+                    self._capture_frozen_arms = True
+                    print(f"\n[yellow][UPPER BODY] FROZEN[/yellow]")
+                else:
+                    self.frozen_arm_obs = None
+                    print(f"\n[yellow][UPPER BODY] TRACKING[/yellow]")
             
-            # Right A - cycle: preview → teleop_full → pause → teleop_full → pause...
-            if right_a_pressed:
-                print(f"\n[yellow]Right A pressed in state: {self.state}[/yellow]")
-                if self.state == "idle":
-                    self.state = "preview"
-                    print("[cyan]→ PREVIEW mode: MuJoCo shows your motion[/cyan]")
-                elif self.state == "preview":
-                    # Enter teleop_full by default (with interpolation)
-                    print("[cyan]→ Starting TELEOP_FULL[/cyan]")
-                    self._start_interpolation("preview", "teleop_full", current_qpos)
-                elif self.state in ["teleop_full", "teleop_loco"]:
-                    # Go to pause (remember current teleop mode and freeze current pose)
-                    self.previous_teleop_state = self.state
-                    self.paused_qpos = current_qpos.copy()  # Freeze the current pose
-                    print(f"[cyan]→ PAUSING (robot freezes at current pose)[/cyan]")
-                    self._start_interpolation(self.state, "paused", current_qpos)
-                elif self.state == "paused":
-                    # Return to previous teleop state (with interpolation)
-                    print(f"[cyan]→ UNPAUSING to {self.previous_teleop_state}[/cyan]")
-                    self._start_interpolation("paused", self.previous_teleop_state, current_qpos)
-            
-            # Left X - toggle teleop_full ↔ teleop_loco (only when in teleop mode)
-            if left_x_pressed:
-                print(f"\n[yellow]Left X pressed in state: {self.state}[/yellow]")
+            # A + Y = toggle between walk and balance (teleop_full ↔ teleop_loco)
+            if left_y and not self._prev_left_y:
+                self._right_a_used_as_modifier = True
                 if self.state == "teleop_full":
-                    print("[cyan]→ Switching to TELEOP_LOCO (walking mode)[/cyan]")
+                    print("\n[cyan]→ Switching to WALK mode (teleop_loco)[/cyan]")
                     self._start_interpolation("teleop_full", "teleop_loco", current_qpos)
                 elif self.state == "teleop_loco":
-                    print("[cyan]→ Switching to TELEOP_FULL[/cyan]")
+                    print("\n[cyan]→ Switching to BALANCE mode (teleop_full)[/cyan]")
                     self._start_interpolation("teleop_loco", "teleop_full", current_qpos)
         
-        # Update button state tracking
-        self._right_key_was_pressed = right_key_one
-        self._left_key_was_pressed = left_key_one
+        # On A release: if not used as modifier, cycle states
+        if not right_a and self._prev_right_a:
+            if not self._right_a_used_as_modifier and not self.is_interpolating and self.state != "exit":
+                # State cycling
+                if self.state == "idle":
+                    self.state = "preview"
+                    print("\n[cyan]→ PREVIEW mode[/cyan]")
+                elif self.state == "preview":
+                    print("\n[cyan]→ Starting TELEOP_FULL[/cyan]")
+                    self._needs_calibration = True
+                    self._start_interpolation("preview", "teleop_full", current_qpos)
+                elif self.state in ["teleop_full", "teleop_loco"]:
+                    self.previous_teleop_state = self.state
+                    self.paused_qpos = current_qpos.copy() if current_qpos is not None else None
+                    print(f"\n[cyan]→ PAUSING[/cyan]")
+                    self._start_interpolation(self.state, "paused", current_qpos)
+                elif self.state == "paused":
+                    self._needs_calibration = True
+                    print(f"\n[cyan]→ UNPAUSING to {self.previous_teleop_state}[/cyan]")
+                    self._start_interpolation("paused", self.previous_teleop_state, current_qpos)
+            self._right_a_held = False
+            self._right_a_used_as_modifier = False
         
-        # Joystick for locomotion - only active in teleop_loco
+        # ===== X/Y Modifier for Finger/Thumb Control =====
+        # Only process if hands are not paused
+        if not self.hands_paused:
+            # X + Trigger = Open fingers (per-hand)
+            if left_x:
+                if left_trig_active:
+                    self.hand_left_position = max(0.0, self.hand_left_position - self.hand_movement_step)
+                if right_trig_active:
+                    self.hand_right_position = max(0.0, self.hand_right_position - self.hand_movement_step)
+            
+            # Y + Trigger = Close fingers (per-hand)
+            if left_y:
+                if left_trig_active:
+                    self.hand_left_position = min(1.0, self.hand_left_position + self.hand_movement_step)
+                if right_trig_active:
+                    self.hand_right_position = min(1.0, self.hand_right_position + self.hand_movement_step)
+            
+            # X + Grip = Thumb outward (per-hand)
+            if left_x:
+                if left_grip_active:
+                    self.thumb_left_rotation = max(0.0, self.thumb_left_rotation - self.thumb_movement_step)
+                if right_grip_active:
+                    self.thumb_right_rotation = max(0.0, self.thumb_right_rotation - self.thumb_movement_step)
+            
+            # Y + Grip = Thumb inward (per-hand)
+            if left_y:
+                if left_grip_active:
+                    self.thumb_left_rotation = min(1.0, self.thumb_left_rotation + self.thumb_movement_step)
+                if right_grip_active:
+                    self.thumb_right_rotation = min(1.0, self.thumb_right_rotation + self.thumb_movement_step)
+        
+        # Update previous button states
+        self._prev_right_a = right_a
+        self._prev_left_x = left_x
+        self._prev_left_y = left_y
+        self._prev_right_trig = right_trig_active
+        self._prev_left_trig = left_trig_active
+        self._prev_right_grip = right_grip_active
+        self._prev_left_grip = left_grip_active
+        
+        # ===== Joystick for locomotion =====
         left_axis = left_ctrl.get("axis", [0, 0])
         right_axis = right_ctrl.get("axis", [0, 0])
         
+        # Only active in teleop_loco (walk mode)
         if self.state == "teleop_loco" or (self.is_interpolating and self.interp_to_state == "teleop_loco"):
-            # Left joystick for movement
-            self.vel_cmd[0] = left_axis[1] if len(left_axis) > 1 else 0.0   # forward/backward
-            self.vel_cmd[1] = -left_axis[0] if len(left_axis) > 0 else 0.0  # strafe
-            # Right joystick for rotation
-            self.vel_cmd[2] = -right_axis[0] if len(right_axis) > 0 else 0.0  # yaw
+            self.vel_cmd[0] = left_axis[1] if len(left_axis) > 1 else 0.0
+            self.vel_cmd[1] = -left_axis[0] if len(left_axis) > 0 else 0.0
+            self.vel_cmd[2] = -right_axis[0] if len(right_axis) > 0 else 0.0
         else:
-            # Zero velocity when not in locomotion mode
             self.vel_cmd[:] = 0.0
     
     def _validate_quaternions(self, smplx_data):
@@ -1107,11 +1212,73 @@ class HybridLocoTeleop:
                     # Apply smooth filtering to reduce jitter
                     mimic_obs = self.apply_smooth(mimic_obs)
                     
+                    # Calibration offset system: capture user's pose when entering teleop
+                    # This makes robot track RELATIVE movement, not absolute position
+                    if self._needs_calibration and mimic_obs is not None:
+                        self.calibration_mimic_obs = mimic_obs.copy()
+                        self._needs_calibration = False
+                        print(f"[green]✓ Calibration captured - robot tracks relative movement[/green]")
+                    
+                    # Apply calibration offset if enabled and calibrated
+                    # KEY: Arms are ABSOLUTE (no offset), body orientation is RELATIVE
+                    if self.use_calibration_offset and self.calibration_mimic_obs is not None and mimic_obs is not None:
+                        # Indices: [0:2]=vel_xy, [2]=height, [3:5]=roll_pitch, [5]=yaw_vel, [6:35]=joints
+                        # Joints: [6:12]=left_leg, [12:18]=right_leg, [18:21]=torso, [21:28]=left_arm, [28:35]=right_arm
+                        mimic_obs_calibrated = mimic_obs.copy()
+                        default_obs = DEFAULT_MIMIC_OBS[self.robot_name]
+                        
+                        # Body orientation (roll/pitch) - RELATIVE offset
+                        # This allows user to reposition body without robot jumping
+                        mimic_obs_calibrated[3:5] = default_obs[3:5] + (mimic_obs[3:5] - self.calibration_mimic_obs[3:5])
+                        
+                        # Legs - RELATIVE offset (allows repositioning)
+                        mimic_obs_calibrated[6:18] = default_obs[6:18] + (mimic_obs[6:18] - self.calibration_mimic_obs[6:18])
+                        
+                        # Torso - RELATIVE offset
+                        mimic_obs_calibrated[18:21] = default_obs[18:21] + (mimic_obs[18:21] - self.calibration_mimic_obs[18:21])
+                        
+                        # Arms - ABSOLUTE (no offset!) 
+                        # User's arm position in preview = exact arm position in teleop
+                        mimic_obs_calibrated[21:35] = mimic_obs[21:35]
+                        
+                        # Height - keep as-is (absolute)
+                        # Velocities (0:2 and 5) are already relative, no offset needed
+                        mimic_obs = mimic_obs_calibrated
+                    
+                    # Upper body freeze: capture arm positions on request
+                    if self._capture_frozen_arms and mimic_obs is not None:
+                        # Store current arm positions (indices 21:35 = left_arm + right_arm)
+                        self.frozen_arm_obs = mimic_obs[21:35].copy()
+                        self._capture_frozen_arms = False
+                        print(f"[cyan]Arm positions captured for freeze[/cyan]")
+                    
+                    # Upper body freeze: use frozen arm positions
+                    if self.hands_paused and self.frozen_arm_obs is not None and mimic_obs is not None:
+                        mimic_obs[21:35] = self.frozen_arm_obs
+                    
+                    # === YAW CONTROL ===
+                    # Robot yaw is NOT controlled by human body rotation!
+                    # - teleop_full (balance): yaw velocity = 0 (robot stays facing same direction)
+                    # - teleop_loco (walk): yaw velocity from joystick only
+                    if mimic_obs is not None:
+                        if self.state == "teleop_full":
+                            # Balance mode: no yaw rotation (robot stays put)
+                            mimic_obs[5] = 0.0
+                        elif self.state == "teleop_loco":
+                            # Walk mode: yaw from joystick (vel_cmd[2])
+                            mimic_obs[5] = self.vel_cmd[2]
+                    
                     # Get neck data from head tracking
                     neck_data = None
                     try:
                         neck_yaw, neck_pitch = human_head_to_robot_neck(smplx_data)
-                        neck_data = [float(neck_yaw * 0.5), float(neck_pitch * 0.5)]
+                        # 1:1 mapping with clamping to robot neck limits
+                        # Robot limits: Yaw ±70° (~1.22 rad), Pitch ±44° (~0.77 rad)
+                        NECK_YAW_LIMIT = 1.22   # ~70 degrees in radians
+                        NECK_PITCH_LIMIT = 0.77  # ~44 degrees in radians
+                        neck_yaw = float(np.clip(neck_yaw, -NECK_YAW_LIMIT, NECK_YAW_LIMIT))
+                        neck_pitch = float(np.clip(neck_pitch, -NECK_PITCH_LIMIT, NECK_PITCH_LIMIT))
+                        neck_data = [neck_yaw, neck_pitch]
                     except Exception as e:
                         # Only log error once
                         if not hasattr(self, '_neck_error_logged'):

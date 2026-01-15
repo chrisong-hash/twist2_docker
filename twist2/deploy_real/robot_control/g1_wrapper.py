@@ -109,6 +109,16 @@ class G1RealWorldEnv:
 
     def default_pos_state(self):
         print("Enter default pos state. Waiting for the Button A signal...")
+        
+        # First, wait for all buttons to be released (debounce from START press)
+        print("  Waiting for buttons to be released...")
+        while self.read_controller_input().keys != 0:
+            default_pos = self.config.default_angles.copy()
+            self.send_robot_action(default_pos)
+            time.sleep(self.config.control_dt)
+        print("  Buttons released. Press A to continue...")
+        
+        # Now wait for A button press
         while self.read_controller_input().keys != self.controller_mapping["A"]:
             # keep the default pos
             default_pos = self.config.default_angles.copy()

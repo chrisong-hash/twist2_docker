@@ -1,26 +1,35 @@
 """
-conda activate gmr
-sudo ufw disable
-python xrobot_teleop_to_robot_w_hand.py --robot unitree_g1
+TWIST2 Teleoperation with Inspire Hands
 
-State Machine Controls:
-- Right controller key_one: Cycle through idle -> teleop -> pause -> teleop...
-- Left controller key_one: Exit program from any state
-- Left controller axis_click: Emergency stop - kills sim2real.sh process
-- Left controller axis: Control root xy velocity and yaw velocity
-- Right controller axis: Fine-tune root xy velocity and yaw velocity
-- Auto-transition: idle -> teleop when motion data is available
+Button Mapping (Combo-based):
+==================================================
+SYSTEM CONTROLS (Right A as modifier):
+  - Right A (release, alone): Toggle teleop/idle
+  - Right A + Left X: Toggle HAND pause
+  - Right A + Left Y: Toggle LEG pause
+  - Left axis_click: Emergency stop
+
+FINGER CONTROL (X/Y + Trigger):
+  - Left X + Left Trigger: Open LEFT fingers
+  - Left X + Right Trigger: Open RIGHT fingers
+  - Left Y + Left Trigger: Close LEFT fingers
+  - Left Y + Right Trigger: Close RIGHT fingers
+
+THUMB CONTROL (X/Y + Grip):
+  - Left X + Left Grip: LEFT thumb outward
+  - Left X + Right Grip: RIGHT thumb outward
+  - Left Y + Left Grip: LEFT thumb inward
+  - Left Y + Right Grip: RIGHT thumb inward
+
+LOCOMOTION:
+  - Left axis: XY velocity
+  - Right axis: Yaw velocity
 
 States:
-- idle: Waiting for input or data
-- teleop: Processing motion retargeting with velocity control
-- pause: Data received but not processing
-- exit: Program will terminate
-
-Whole-Body Teleop Features:
-- Sends whole-body mode information to Redis
-- 35-dimensional mimic observations
-- Uses retargeted motion directly from the teleoperation stream
+  - idle: Waiting, default pose
+  - teleop: Active motion tracking
+  - exit: Shutdown sequence
+==================================================
 """
 import argparse
 import json
@@ -110,14 +119,41 @@ def extract_mimic_obs_whole_body(qpos, last_qpos, dt=1/30):
 class StateMachine:
     def __init__(self, enable_smooth=False, smooth_window_size=5, use_pinch=False):
         """
-        State process for teleoperation:
-        idle -> teleop -> pause -> teleop ... -> idle -> exit
+        State process for teleoperation with combo button support.
+        
+        NEW BUTTON MAPPING:
+        - Right A (release, if not used as modifier): Toggle teleop/preview
+        - Right A + Left X: Toggle hand pause
+        - Right A + Left Y: Toggle leg pause
+        - Left X + trigger: Open fingers (per-hand)
+        - Left Y + trigger: Close fingers (per-hand)
+        - Left X + grip: Thumb outward (per-hand)
+        - Left Y + grip: Thumb inward (per-hand)
+        - Left axis_click: Emergency stop
         """
         self.state = "idle"
         self.previous_state = "idle"
-        self.right_key_one_was_pressed = False
-        self.left_key_one_was_pressed = False
-        self.left_axis_click_was_pressed = False
+        
+        # Button state tracking
+        self._right_a_held = False
+        self._right_a_used_as_modifier = False
+        self._left_x_held = False
+        self._left_y_held = False
+        self._left_axis_click_was_pressed = False
+        
+        # Previous button states for edge detection
+        self._prev_right_a = False
+        self._prev_left_x = False
+        self._prev_left_y = False
+        self._prev_right_trig = False
+        self._prev_left_trig = False
+        self._prev_right_grip = False
+        self._prev_left_grip = False
+        
+        # Pause states (separate for hands and legs)
+        self.hands_paused = False
+        self.legs_paused = False
+        
         # Interpolation state
         self.is_interpolating = False
         self.interpolation_start_time = None
@@ -129,12 +165,16 @@ class StateMachine:
         self.current_neck_data = None
         self.last_neck_data = None
 
-        # Hand state - interpolation values (0.0 = open, 1.0 = closed)
-        self.hand_left_position = 0.0  # 0.0 = fully open, 1.0 = fully closed
+        # Hand state - per-finger control (0.0 = open, 1.0 = closed)
+        self.hand_left_position = 0.0  # fingers
         self.hand_right_position = 0.0
+        self.thumb_left_rotation = 0.5  # 0.0 = outward, 1.0 = inward, 0.5 = neutral
+        self.thumb_right_rotation = 0.5
         self.use_pinch = use_pinch
+        
         # Hand control parameters
-        self.hand_movement_step = 0.05  # 5% movement per press/hold
+        self.hand_movement_step = 0.05  # 5% per frame when held
+        self.thumb_movement_step = 0.03  # 3% per frame for thumb rotation
         
         # Velocity commands from joystick
         self.velocity_commands = np.array([0.0, 0.0, 0.0])  # [vx, vy, vyaw]
@@ -150,68 +190,104 @@ class StateMachine:
         self.previous_state = self.state
         
         # Get current button states
-        right_key_current = controller_data.get('RightController', {}).get('key_one', False)
-        left_key_current = controller_data.get('LeftController', {}).get('key_one', False)
+        right_ctrl = controller_data.get('RightController', {})
+        left_ctrl = controller_data.get('LeftController', {})
         
-        # Hand control - index_trig for close, grip for open
-        right_index_trig_current = controller_data.get('RightController', {}).get('index_trig', False)
-        left_index_trig_current = controller_data.get('LeftController', {}).get('index_trig', False)
-        right_grip_current = controller_data.get('RightController', {}).get('grip', False)
-        left_grip_current = controller_data.get('LeftController', {}).get('grip', False)
-
-        # Emergency stop - left controller axis_click
-        left_axis_click_current = controller_data.get('LeftController', {}).get('axis_click', False)
-
-        # Detect button presses
-        right_key_just_pressed = right_key_current and not self.right_key_one_was_pressed
-        left_key_just_pressed = left_key_current and not self.left_key_one_was_pressed
-        left_axis_click_just_pressed = left_axis_click_current and not self.left_axis_click_was_pressed
-
-        # Handle left axis click - emergency stop
-        if left_axis_click_just_pressed:
+        right_a = right_ctrl.get('key_one', False)      # Right A button
+        right_b = right_ctrl.get('key_two', False)      # Right B button
+        left_x = left_ctrl.get('key_one', False)        # Left X button
+        left_y = left_ctrl.get('key_two', False)        # Left Y button
+        
+        right_trig = right_ctrl.get('index_trig', False)
+        left_trig = left_ctrl.get('index_trig', False)
+        right_grip = right_ctrl.get('grip', False)
+        left_grip = left_ctrl.get('grip', False)
+        
+        left_axis_click = left_ctrl.get('axis_click', False)
+        
+        # ===== Emergency Stop (Left axis click) =====
+        if left_axis_click and not self._left_axis_click_was_pressed:
             self._emergency_stop()
-
-        # Handle left key press - exit from any state
-        if left_key_just_pressed:
-            self.state = "exit"
-
-        # Handle right key press - cycle between idle, teleop, pause
-        elif right_key_just_pressed:
-            if self.state == "idle":
-                self.state = "teleop"
-            elif self.state == "teleop":
-                self.state = "pause"
-            elif self.state == "pause":
-                self.state = "teleop"
-
-        # Handle hand control - continuous interpolation
-        # Right hand control
-        if right_index_trig_current:  # Close right hand
-            new_position = min(1.0, self.hand_right_position + self.hand_movement_step)
-            if new_position != self.hand_right_position:
-                self.hand_right_position = new_position
-        elif right_grip_current:  # Open right hand
-            new_position = max(0.0, self.hand_right_position - self.hand_movement_step)
-            if new_position != self.hand_right_position:
-                self.hand_right_position = new_position
         
-        # Left hand control
-        if left_index_trig_current:  # Close left hand
-            new_position = min(1.0, self.hand_left_position + self.hand_movement_step)
-            if new_position != self.hand_left_position:
-                self.hand_left_position = new_position
-        elif left_grip_current:  # Open left hand
-            new_position = max(0.0, self.hand_left_position - self.hand_movement_step)
-            if new_position != self.hand_left_position:
-                self.hand_left_position = new_position
+        # ===== A Button Modifier Logic =====
+        # On A press: start tracking
+        if right_a and not self._prev_right_a:
+            self._right_a_held = True
+            self._right_a_used_as_modifier = False
+        
+        # While A is held, check for combos
+        if self._right_a_held:
+            # A + X = toggle hand pause
+            if left_x and not self._prev_left_x:
+                self._right_a_used_as_modifier = True
+                self.hands_paused = not self.hands_paused
+                status = "PAUSED" if self.hands_paused else "ACTIVE"
+                print(f"[HANDS] {status}")
+            
+            # A + Y = toggle leg pause
+            if left_y and not self._prev_left_y:
+                self._right_a_used_as_modifier = True
+                self.legs_paused = not self.legs_paused
+                status = "PAUSED" if self.legs_paused else "ACTIVE"
+                print(f"[LEGS] {status}")
+        
+        # On A release: if not used as modifier, toggle teleop
+        if not right_a and self._prev_right_a:
+            if not self._right_a_used_as_modifier:
+                # Toggle between idle and teleop
+                if self.state == "idle":
+                    self.state = "teleop"
+                    print("[STATE] idle → teleop")
+                elif self.state == "teleop":
+                    self.state = "idle"
+                    print("[STATE] teleop → idle")
+            self._right_a_held = False
+            self._right_a_used_as_modifier = False
+        
+        # ===== X/Y Modifier for Finger/Thumb Control =====
+        self._left_x_held = left_x
+        self._left_y_held = left_y
+        
+        # X + Trigger = Open fingers (per-hand)
+        if left_x:
+            if left_trig:  # Open left hand
+                self.hand_left_position = max(0.0, self.hand_left_position - self.hand_movement_step)
+            if right_trig:  # Open right hand
+                self.hand_right_position = max(0.0, self.hand_right_position - self.hand_movement_step)
+        
+        # Y + Trigger = Close fingers (per-hand)
+        if left_y:
+            if left_trig:  # Close left hand
+                self.hand_left_position = min(1.0, self.hand_left_position + self.hand_movement_step)
+            if right_trig:  # Close right hand
+                self.hand_right_position = min(1.0, self.hand_right_position + self.hand_movement_step)
+        
+        # X + Grip = Thumb outward (per-hand)
+        if left_x:
+            if left_grip:  # Left thumb outward
+                self.thumb_left_rotation = max(0.0, self.thumb_left_rotation - self.thumb_movement_step)
+            if right_grip:  # Right thumb outward
+                self.thumb_right_rotation = max(0.0, self.thumb_right_rotation - self.thumb_movement_step)
+        
+        # Y + Grip = Thumb inward (per-hand)
+        if left_y:
+            if left_grip:  # Left thumb inward
+                self.thumb_left_rotation = min(1.0, self.thumb_left_rotation + self.thumb_movement_step)
+            if right_grip:  # Right thumb inward
+                self.thumb_right_rotation = min(1.0, self.thumb_right_rotation + self.thumb_movement_step)
         
         # Extract velocity commands from controller axes
         self._update_velocity_commands(controller_data)
         
-        # Update button state tracking
-        self.right_key_one_was_pressed = right_key_current
-        self.left_key_one_was_pressed = left_key_current
-        self.left_axis_click_was_pressed = left_axis_click_current
+        # Update previous button states for edge detection
+        self._prev_right_a = right_a
+        self._prev_left_x = left_x
+        self._prev_left_y = left_y
+        self._prev_right_trig = right_trig
+        self._prev_left_trig = left_trig
+        self._prev_right_grip = right_grip
+        self._prev_left_grip = left_grip
+        self._left_axis_click_was_pressed = left_axis_click
     
     def _update_velocity_commands(self, controller_data):
         """Update velocity commands from controller axes"""
@@ -269,7 +345,20 @@ class StateMachine:
         return self.state == "teleop" and not self.is_interpolating
     
     def get_hand_state(self):
+        """Return finger positions (0=open, 1=closed)"""
         return self.hand_left_position, self.hand_right_position
+    
+    def get_thumb_state(self):
+        """Return thumb rotation (0=outward, 0.5=neutral, 1=inward)"""
+        return self.thumb_left_rotation, self.thumb_right_rotation
+    
+    def is_hands_paused(self):
+        """Return True if hand control is paused"""
+        return self.hands_paused
+    
+    def is_legs_paused(self):
+        """Return True if leg control is paused"""
+        return self.legs_paused
     
     def get_hand_pose(self, robot_name):
         """Get interpolated hand poses based on current hand positions"""
@@ -479,23 +568,35 @@ class XRobotTeleopToRobot:
             self.use_inspire_hands = False
     
     def control_inspire_hands(self):
-        """Control Inspire hands based on trigger state"""
+        """Control Inspire hands based on button combos"""
         if not self.use_inspire_hands or self.inspire_hand_controller is None:
             return
         
+        # Skip if hands are paused
+        if self.state_machine.is_hands_paused():
+            return
+        
         try:
-            # Get trigger positions from state machine
+            # Get finger positions from state machine
             hand_left_pos = self.state_machine.hand_left_position
             hand_right_pos = self.state_machine.hand_right_position
             
-            # Invert: state machine 0.0=open, 1.0=closed
-            # Inspire hands 0.0=open, 1.0=closed (same convention now)
-            # But angle values are: 2000=open, 0=closed
-            # So we need to invert
+            # Get thumb rotations
+            thumb_left_rot, thumb_right_rot = self.state_machine.get_thumb_state()
+            
+            # Invert finger position: state machine 0.0=open, 1.0=closed
+            # Inspire hands angle 2000=open, 0=closed, so we invert
             left_inspire_pos = 1.0 - hand_left_pos
             right_inspire_pos = 1.0 - hand_right_pos
             
-            self.inspire_hand_controller.ctrl_dual_hand(left_inspire_pos, right_inspire_pos)
+            # Thumb rotation: state machine 0=outward, 1=inward
+            # Inspire angle 2000=outward, 0=inward, so we pass directly
+            # (the wrapper handles the mapping)
+            
+            self.inspire_hand_controller.ctrl_dual_hand(
+                left_inspire_pos, right_inspire_pos,
+                thumb_left_rot, thumb_right_rot
+            )
             
         except Exception as e:
             print(f"[INSPIRE] Error controlling hands: {e}")
@@ -628,7 +729,7 @@ class XRobotTeleopToRobot:
         return obs
         
     def _get_teleop_mimic_obs(self, current_retarget_obs):
-        """Get mimic obs for teleop state, handling interpolation"""
+        """Get mimic obs for teleop state, handling interpolation and pause states"""
         if self.state_machine.is_interpolating:
             interp_obs = get_interpolated_obs(self.state_machine)
             if interp_obs is not None:
@@ -640,10 +741,22 @@ class XRobotTeleopToRobot:
             obs_35d = current_retarget_obs[:35] if len(current_retarget_obs) > 35 else current_retarget_obs
             obs_35d = obs_35d.copy()  # Make a copy to avoid modifying original
             
-            # Joystick locomotion mode: inject joystick velocity into mimic_obs
             # mimic_obs structure: [vx, vy, z, roll, pitch, vyaw, joints[0:29]]
             # joints: [0:6]=left_leg, [6:12]=right_leg, [12:15]=waist, [15:22]=left_arm, [22:29]=right_arm
-            if getattr(self.args, 'joystick_locomotion', False):
+            
+            # Leg pause: freeze legs at default standing pose
+            if self.state_machine.is_legs_paused():
+                default_left_leg = np.array([-0.2, 0.0, 0.0, 0.4, -0.2, 0.0])
+                default_right_leg = np.array([-0.2, 0.0, 0.0, 0.4, -0.2, 0.0])
+                obs_35d[6:12] = default_left_leg   # Left leg joints
+                obs_35d[12:18] = default_right_leg  # Right leg joints
+                # Also zero out velocity commands
+                obs_35d[0] = 0.0  # vx
+                obs_35d[1] = 0.0  # vy
+                obs_35d[5] = 0.0  # vyaw
+            
+            # Joystick locomotion mode: inject joystick velocity into mimic_obs
+            if getattr(self.args, 'joystick_locomotion', False) and not self.state_machine.is_legs_paused():
                 velocity_commands = self.state_machine.get_velocity_commands()
                 if velocity_commands is not None:
                     # Scale factors for velocity (tune these as needed)
@@ -656,14 +769,11 @@ class XRobotTeleopToRobot:
                     obs_35d[1] = velocity_commands[1] * vy_scale   # vy from left joystick X
                     obs_35d[5] = velocity_commands[2] * vyaw_scale # vyaw from right joystick X
                     
-                    # Option B: Replace leg positions with default standing
-                    # This makes legs respond ONLY to velocity (joystick), not body tracking
-                    # Default leg angles from g1.yaml:
+                    # Replace leg positions with default standing
                     default_left_leg = np.array([-0.2, 0.0, 0.0, 0.4, -0.2, 0.0])
                     default_right_leg = np.array([-0.2, 0.0, 0.0, 0.4, -0.2, 0.0])
                     obs_35d[6:12] = default_left_leg   # Left leg joints
                     obs_35d[12:18] = default_right_leg  # Right leg joints
-                    # Upper body (waist + arms) still tracks from body tracking
                     
                     # Debug print velocity injection
                     if np.any(np.abs(velocity_commands) > 0.01):
@@ -779,13 +889,23 @@ class XRobotTeleopToRobot:
         self.setup_rate_limiter()
         self.setup_inspire_hands()
 
-        print("Teleop state machine initialized. Controls:")
-        print("- Right controller key_one: Cycle through idle -> teleop -> pause -> teleop...")
-        print("- Left controller key_one: Exit program")
-        print("- Left controller axis_click: Emergency stop - kills sim2real.sh process")
-        print("- Left controller axis: Control root xy velocity")
-        print("- Right controller axis: Control yaw velocity")
-        print("- Publishes 35-dimensional mimic observations")
+        print("\n" + "="*50)
+        print("TELEOP CONTROLS (Combo-based)")
+        print("="*50)
+        print("SYSTEM:")
+        print("  Right A (release): Toggle teleop/idle")
+        print("  Right A + Left X:  Toggle HAND pause")
+        print("  Right A + Left Y:  Toggle LEG pause")
+        print("  Left axis_click:   Emergency stop")
+        print("")
+        print("FINGERS (X/Y + Trigger):")
+        print("  X + Trigger: Open fingers (per-hand)")
+        print("  Y + Trigger: Close fingers (per-hand)")
+        print("")
+        print("THUMBS (X/Y + Grip):")
+        print("  X + Grip: Thumb outward (per-hand)")
+        print("  Y + Grip: Thumb inward (per-hand)")
+        print("="*50)
         print(f"Starting in state: {self.state_machine.get_current_state()}")
 
         if self.state_machine.enable_smooth:

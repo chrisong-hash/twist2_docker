@@ -92,6 +92,7 @@ python teleop_hybrid.py \
     --redis_ip $redis_ip \
     --target_fps $target_fps \
     --smooth --smooth_window_size 4 \
+    --use_inspire_hands \
     --inspire_left_ip $inspire_left_ip \
     --inspire_right_ip $inspire_right_ip
 

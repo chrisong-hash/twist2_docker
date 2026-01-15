@@ -426,7 +426,8 @@ class RealTimePolicyController(object):
                 
                 # Check if teleop data is available (keys may not exist yet)
                 if redis_results[0] is None:
-                    # No teleop data yet, skip this iteration
+                    # No teleop data yet - hold default standing position
+                    self.env.send_robot_action(self.default_dof_pos)
                     elapsed = time.time() - t_start
                     if elapsed < self.control_dt:
                         time.sleep(self.control_dt - elapsed)

@@ -255,21 +255,24 @@ class InspireHandController:
         
         return self._send_modbus_command(0x10, self.SET_ANGLE_REG, angles_clamped.tolist())
     
-    def set_position_normalized(self, position):
+    def set_position_normalized(self, position, thumb_rotation=0.5):
         """
-        Set hand position with normalized value (0.0 to 1.0)
+        Set hand position with normalized values
         
         Args:
-            position: 0.0 = fully open, 1.0 = fully closed
+            position: 0.0 = fingers fully open, 1.0 = fingers fully closed
+            thumb_rotation: 0.0 = outward, 0.5 = neutral, 1.0 = inward
         """
         position = np.clip(position, 0.0, 1.0)
+        thumb_rotation = np.clip(thumb_rotation, 0.0, 1.0)
         
         # Map 0.0-1.0 to ANGLE_MAX-ANGLE_MIN (inverted: 0.0=open=2000, 1.0=closed=0)
-        angles = self.ANGLE_MAX - (position * (self.ANGLE_MAX - self.ANGLE_MIN))
-        angles = np.full(self.NUM_DOFS, angles, dtype=np.int16)
+        finger_angle = self.ANGLE_MAX - (position * (self.ANGLE_MAX - self.ANGLE_MIN))
+        angles = np.full(self.NUM_DOFS, finger_angle, dtype=np.int16)
         
-        # Keep thumb (DOF 5) at 1000 (open position)
-        angles[5] = 1000
+        # Thumb rotation (DOF 5): 0=outward(2000), 0.5=neutral(1000), 1=inward(0)
+        thumb_angle = self.ANGLE_MAX - (thumb_rotation * (self.ANGLE_MAX - self.ANGLE_MIN))
+        angles[5] = int(thumb_angle)
         
         return self.set_angles(angles)
     
@@ -329,16 +332,19 @@ class DualHandController:
         
         print("[INSPIRE] ✓ Inspire hands initialized")
     
-    def ctrl_dual_hand(self, left_position, right_position):
+    def ctrl_dual_hand(self, left_position, right_position, 
+                        left_thumb_rotation=0.5, right_thumb_rotation=0.5):
         """
         Control both hands with normalized positions
         
         Args:
             left_position: 0.0-1.0 (0.0=open, 1.0=closed)
             right_position: 0.0-1.0 (0.0=open, 1.0=closed)
+            left_thumb_rotation: 0.0=outward, 0.5=neutral, 1.0=inward
+            right_thumb_rotation: 0.0=outward, 0.5=neutral, 1.0=inward
         """
-        self.left_hand.set_position_normalized(left_position)
-        self.right_hand.set_position_normalized(right_position)
+        self.left_hand.set_position_normalized(left_position, left_thumb_rotation)
+        self.right_hand.set_position_normalized(right_position, right_thumb_rotation)
     
     def open_both(self):
         """Open both hands"""

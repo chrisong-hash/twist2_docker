@@ -83,7 +83,11 @@ ADDR_HARDWARE_ERROR = 70
 PROTOCOL_VERSION = 2.0
 # Movement range from center (in position units, ~0.088 deg each)
 YAW_RANGE = 792    # ±792 from center (~70 degrees each way, symmetric)
-PITCH_RANGE = 500  # ±500 from center (~44 degrees each way)
+
+# Pitch is asymmetric - can look down much more than up
+# Motor position INCREASES when looking DOWN, DECREASES when looking UP
+PITCH_RANGE_UP = 50     # ~4.4 degrees up (limited by physical min 1630)
+PITCH_RANGE_DOWN = 800  # ~70 degrees down (physical max allows 982)
 
 # Absolute physical limits (safety clamps)
 YAW_ABS_MIN = 330
@@ -554,8 +558,9 @@ class NeckController:
         # Calculate dynamic limits from center
         yaw_min = self.yaw_center - YAW_RANGE
         yaw_max = self.yaw_center + YAW_RANGE
-        pitch_min = self.pitch_center - PITCH_RANGE
-        pitch_max = self.pitch_center + PITCH_RANGE
+        # Pitch is asymmetric: pos decreases when looking UP, increases when looking DOWN
+        pitch_min = self.pitch_center - PITCH_RANGE_UP    # Max UP position
+        pitch_max = self.pitch_center + PITCH_RANGE_DOWN  # Max DOWN position
         
         positions_per_rad = 4096 / (2 * math.pi)
         yaw_pos = self.yaw_center + int(yaw_rad * positions_per_rad)
