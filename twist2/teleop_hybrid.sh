@@ -1,5 +1,21 @@
 #!/bin/bash
-# Hybrid Teleop - Full Robot Control
+
+# TWIST2 Hybrid Teleoperation Launch Script
+# Combines PICO controller trigger-based control with Manus glove fine control
+
+echo "=============================================="
+echo "  TWIST2 Hybrid Teleop (PICO + Manus Gloves)"
+echo "=============================================="
+
+# Check XRoboToolkit PC Service (informational only)
+if pgrep -f -i "xrobo" > /dev/null 2>&1; then
+    echo "[✓] XRoboToolkit PC Service detected"
+else
+    echo "[!] XRoboToolkit PC Service may not be running"
+    echo "    If PICO connection fails, start it from Applications menu"
+    echo ""
+fi
+
 # ===================================
 # Complete teleop with hybrid locomotion, neck tracking, and Inspire hands.
 # Uses GROOT GearWBC for stable walking with arbitrary arm poses.
@@ -32,6 +48,8 @@ if [ $? -ne 0 ]; then
     redis-server --daemonize yes
     sleep 1
 fi
+echo "[✓] Redis ready"
+echo ""
 
 # Navigate to deployment directory
 cd "$(dirname "$0")/deploy_real" || exit 1
@@ -43,18 +61,29 @@ conda activate gmr
 # Configuration
 actual_human_height=1.80
 redis_ip="localhost"
-target_fps=50
 
-# Inspire hand IPs (on robot network)
+# Inspire hand IPs
 inspire_left_ip="192.168.123.210"
 inspire_right_ip="192.168.123.211"
 
+# Xsens UDP port for Manus gloves
+xsens_port=9763
+
+echo "Configuration:"
+echo "  Robot: unitree_g1"
+echo "  Human height: ${actual_human_height}m"
+echo "  Redis: ${redis_ip}"
+echo "  Inspire hands: L=${inspire_left_ip}, R=${inspire_right_ip}"
+echo "  Xsens port: ${xsens_port}"
 echo ""
-echo "============================================================"
-echo "  HYBRID TELEOP - Full Robot Control"
-echo "============================================================"
+echo "Boot Sequence:"
+echo "  1. Press Unitree START button → Ready state"
+echo "  2. Press Unitree A button → Preop mode"
 echo ""
-echo "Complete teleop: body + neck + locomotion + Inspire hands"
+echo "Teleop Modes:"
+echo "  - PICO Right A: Enter PICO finger mode (trigger-based)"
+echo "  - Unitree A: Enter Manus glove mode (fine control)"
+echo "  - PICO Right A: Return to preop (from either mode)"
 echo ""
 echo "Prerequisites:"
 echo "  1. XRobotToolkit app running on Pico"
@@ -89,26 +118,17 @@ echo "  7. Reposition your body, press Right A → UNPAUSE (recalibrates)"
 echo "============================================================"
 echo ""
 
-# Check if RoboMimic_Deploy exists
-if [ ! -d "/workspace/RoboMimic_Deploy" ]; then
-    echo "ERROR: RoboMimic_Deploy not mounted in container!"
-    echo ""
-    echo "Update docker-compose.yml and restart container:"
-    echo "  docker-compose down && docker-compose up -d"
-    exit 1
-fi
-
-# Run the hybrid teleop (Inspire hands enabled by default)
-python teleop_hybrid.py \
+# Run hybrid teleoperation
+python xrobot_teleop_hybrid.py \
     --robot unitree_g1 \
     --actual_human_height $actual_human_height \
     --redis_ip $redis_ip \
-    --target_fps $target_fps \
-    --smooth --smooth_window_size 4 \
+    --target_fps 100 \
     --use_inspire_hands \
     --inspire_left_ip $inspire_left_ip \
-    --inspire_right_ip $inspire_right_ip
+    --inspire_right_ip $inspire_right_ip \
+    --enable_manus \
+    --xsens_port $xsens_port
 
 echo ""
-echo "Hybrid teleop stopped."
-
+echo "Hybrid teleoperation stopped."

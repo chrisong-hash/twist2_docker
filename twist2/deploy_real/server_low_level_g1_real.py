@@ -381,6 +381,17 @@ class RealTimePolicyController(object):
                     select_pressed = self.env.read_controller_input().keys == self.env.controller_mapping["select"]
                     self.redis_client.set("motion_exit_signal", "1" if select_pressed else "0")
                     
+                    # Publish full remote controller state for hybrid teleop
+                    remote_input = self.env.read_controller_input()
+                    remote_state = {
+                        'lx': float(remote_input.lx),
+                        'ly': float(remote_input.ly),
+                        'rx': float(remote_input.rx),
+                        'ry': float(remote_input.ry),
+                        'button': [int(b) for b in remote_input.btn]
+                    }
+                    self.redis_client.set("unitree_remote_state", json.dumps(remote_state))
+                    
                 if self.env.read_controller_input().keys == self.env.controller_mapping["select"]:
                     print("Select pressed, exiting main loop.")
                     break
