@@ -36,7 +36,7 @@ States:
 
 KEY BEHAVIOR (matches original TWIST2):
   - Direct tracking: mimic_obs passed through directly
-  - Robot does NOT rotate when you rotate (waist_yaw locked at 0)
+  - Robot does NOT rotate when you rotate (waist_yaw at index 20 locked at 0)
   - Yaw rotation ONLY from joystick in walk mode
 
 All mode transitions have smooth 1-second interpolation.
@@ -627,7 +627,7 @@ class HybridLocoTeleop:
         print("  paused      : MuJoCo tracks, robot FROZEN (reposition freely)")
         print("\n[cyan]Key behavior:[/cyan]")
         print("  - Direct tracking (like original TWIST2)")
-        print("  - Robot does NOT rotate when you rotate (waist_yaw locked)")
+        print("  - Robot does NOT rotate when you rotate (waist_yaw[20] locked)")
         print("  - Thumb lags 0.25s behind fingers when closing")
         print("="*60 + "\n")
     
@@ -702,7 +702,7 @@ class HybridLocoTeleop:
             # Apply state-specific poses
             if self.interp_to_state == "teleop_full":
                 # In teleop_full, entire body tracks GMR
-                # (waist_yaw will be fixed to 0 in mimic_obs before sending to Redis)
+                # (waist_yaw at index 20 will be fixed to 0 in mimic_obs before sending to Redis)
                 pass
             elif self.interp_to_state == "teleop_loco":
                 # Locomotion mode: legs + waist at LocoMode default, arms track GMR
@@ -1255,10 +1255,11 @@ class HybridLocoTeleop:
                     if mimic_obs is not None:
                         # Indices: [0:2]=vel_xy, [2]=height, [3:5]=roll_pitch, [5]=yaw_vel, [6:35]=joints
                         # Joints: [6:12]=left_leg, [12:18]=right_leg, [18:21]=torso, [21:28]=left_arm, [28:35]=right_arm
+                        # Torso order: [18]=torso_pitch, [19]=waist_roll, [20]=waist_yaw
                         
-                        # ANTI-ROTATION: Force waist_yaw (index 18) to 0
+                        # ANTI-ROTATION: Force waist_yaw (index 20) to 0
                         # This prevents the robot from rotating when the human rotates their torso
-                        mimic_obs[18] = 0.0  # waist_yaw = 0
+                        mimic_obs[20] = 0.0  # waist_yaw = 0
                     
                     # Upper body freeze: capture arm positions on request
                     if self._capture_frozen_arms and mimic_obs is not None:
