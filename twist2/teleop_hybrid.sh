@@ -9,15 +9,21 @@
 #   preview : MuJoCo preview (calibrate here)
 #   teleop  : Active teleoperation
 #
-# Controls:
-#   Left X (tap)        : Toggle preview ↔ teleop
-#   Right A (teleop)    : Toggle upper body (tracking ↔ frozen)
-#   Right B (teleop)    : Toggle lower body (standing ↔ walking)
-#   Right A+B (hold 1s) : EMERGENCY SHUTDOWN
-#   Left joystick       : Walk (in walking mode)
-#   Right joystick      : Rotate (in walking mode)
-#   Left trigger        : Toggle left hand (open ↔ closed)
-#   Right trigger       : Toggle right hand (open ↔ closed)
+# Controls (Pico VR Controller):
+#   Right A (release)   : Cycle idle → preview → teleop → pause → teleop...
+#   Right A + Left X    : Toggle upper body freeze (arms+hands)
+#   Right A + Left Y    : Toggle walk ↔ balance mode
+#   Right A+B           : EMERGENCY SHUTDOWN
+#   Left Trigger        : Open LEFT hand
+#   Right Trigger       : Open RIGHT hand
+#   Left Grip           : Close LEFT hand (thumb lags 1 sec)
+#   Right Grip          : Close RIGHT hand (thumb lags 1 sec)
+#   Left X + L Trigger  : LEFT thumb outward
+#   Left X + R Trigger  : RIGHT thumb outward
+#   Left X + L Grip     : LEFT thumb inward
+#   Left X + R Grip     : RIGHT thumb inward
+#   Left joystick       : Walk (in walk mode)
+#   Right joystick      : Rotate (in walk mode)
 
 # Make sure Redis is running
 redis-cli ping > /dev/null 2>&1
@@ -56,23 +62,30 @@ echo "  2. Pico connected to this PC"
 echo "  3. RoboMimic_Deploy mounted at /workspace/RoboMimic_Deploy"
 echo "  4. For robot: run sim2real_full.sh in another terminal"
 echo ""
-echo "Controls:"
-echo "  Left X         : Toggle preview ↔ teleop"
-echo "  Right A        : Toggle upper body (tracking ↔ frozen)"
-echo "  Right B        : Toggle lower body (standing ↔ walking)"
-echo "  Right A+B      : EMERGENCY SHUTDOWN (hold 1s)"
-echo "  Left joystick  : Walk (in walking mode)"
-echo "  Right joystick : Rotate (in walking mode)"
-echo "  Left trigger   : Toggle left hand (open ↔ closed)"
-echo "  Right trigger  : Toggle right hand (open ↔ closed)"
+echo "Controls (Pico VR - NOT Unitree remote!):"
+echo "  Right A (release) : Cycle idle → preview → teleop → pause..."
+echo "  Right A + Left X  : Toggle upper body freeze (arms+hands)"
+echo "  Right A + Left Y  : Toggle walk ↔ balance mode"
+echo "  Right A+B         : EMERGENCY SHUTDOWN"
+echo "  Left Trigger      : Open LEFT hand"
+echo "  Right Trigger     : Open RIGHT hand"
+echo "  Left Grip         : Close LEFT hand (thumb lags 1 sec)"
+echo "  Right Grip        : Close RIGHT hand (thumb lags 1 sec)"
+echo "  Left X + L Trigger: LEFT thumb outward"
+echo "  Left X + R Trigger: RIGHT thumb outward"
+echo "  Left X + L Grip   : LEFT thumb inward"
+echo "  Left X + R Grip   : RIGHT thumb inward"
+echo "  Left joystick     : Walk (in walk mode)"
+echo "  Right joystick    : Rotate (in walk mode)"
 echo ""
 echo "Workflow:"
-echo "  1. Run this script (PC side)"
+echo "  1. Run this script (PC side - teleop controller)"
 echo "  2. In another terminal: sim2real_full.sh (robot side)"
-echo "  3. Pico connects → auto enters preview"
-echo "  4. Press Left X → teleop (robot follows you)"
-echo "  5. Press Right B → walking mode (joystick locomotion)"
-echo "  6. Press Left X → preview (robot freezes)"
+echo "  3. Pico connects → auto enters PREVIEW (MuJoCo shows your motion)"
+echo "  4. Press Right A on Pico → TELEOP (robot follows you)"
+echo "  5. Press Right A + Left Y → WALK mode (joystick locomotion)"
+echo "  6. Press Right A again → PAUSE (robot freezes)"
+echo "  7. Reposition your body, press Right A → UNPAUSE (recalibrates)"
 echo "============================================================"
 echo ""
 

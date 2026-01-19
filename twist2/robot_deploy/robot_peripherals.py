@@ -125,6 +125,7 @@ class VideoServer:
         self.grab_fail_count = 0
         self.camera_restart_count = 0
         self.warmup_frames_remaining = CAMERA_WARMUP_FRAMES
+        self.camera_has_error = False  # Flag to track if camera needs restart
         
     def start_command_server(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -187,6 +188,14 @@ class VideoServer:
                 
                 if b'OPEN_CAMERA' in data:
                     print(f"[Video] Got OPEN_CAMERA from {self.pico_ip}")
+                    
+                    # Check if camera needs restart (had errors or not initialized)
+                    camera_missing = (self.zed is None and self.cap is None)
+                    if self.camera_has_error or camera_missing:
+                        print(f"[Video] Camera needs restart (error={self.camera_has_error}, missing={camera_missing})")
+                        print("[Video] Reinitializing camera...")
+                        self.restart_camera()
+                    
                     client.send(struct.pack('<I', 0))
                     self.should_stream = True
                     threading.Thread(target=self.stream_video, daemon=True).start()
@@ -299,6 +308,7 @@ class VideoServer:
             result = self.zed.grab()
             if result == sl.ERROR_CODE.SUCCESS:
                 self.grab_fail_count = 0  # Reset on success
+                self.camera_has_error = False  # Clear error flag on success
                 image = sl.Mat()
                 self.zed.retrieve_image(image, sl.VIEW.SIDE_BY_SIDE, sl.MEM.CPU)
                 frame = image.get_data()
@@ -308,17 +318,20 @@ class VideoServer:
             else:
                 self.grab_fail_count += 1
                 if self.grab_fail_count >= CAMERA_FAIL_THRESHOLD:
-                    print(f"[Video] Camera grab failed {self.grab_fail_count} times, restarting...")
+                    print(f"[Video] Camera grab failed {self.grab_fail_count} times, marking as error...")
+                    self.camera_has_error = True  # Mark camera as having error
                     self.restart_camera()
         elif self.cap:
             ret, frame = self.cap.read()
             if ret:
                 self.grab_fail_count = 0
+                self.camera_has_error = False  # Clear error flag on success
                 return frame
             else:
                 self.grab_fail_count += 1
                 if self.grab_fail_count >= CAMERA_FAIL_THRESHOLD:
-                    print(f"[Video] Camera read failed {self.grab_fail_count} times, restarting...")
+                    print(f"[Video] Camera read failed {self.grab_fail_count} times, marking as error...")
+                    self.camera_has_error = True  # Mark camera as having error
                     self.restart_camera()
         return None
     
@@ -353,8 +366,10 @@ class VideoServer:
         # Reinitialize
         self.grab_fail_count = 0
         if self.init_camera(try_usb_reset=try_usb_reset):
+            self.camera_has_error = False  # Clear error flag on successful restart
             print(f"[Video] Camera restarted successfully (attempt #{self.camera_restart_count})")
         else:
+            self.camera_has_error = True  # Keep error flag set if restart failed
             print(f"[Video] Camera restart failed (attempt #{self.camera_restart_count})")
         return None
     

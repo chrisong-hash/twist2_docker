@@ -255,24 +255,35 @@ class InspireHandController:
         
         return self._send_modbus_command(0x10, self.SET_ANGLE_REG, angles_clamped.tolist())
     
-    def set_position_normalized(self, position, thumb_rotation=0.5):
+    def set_position_normalized(self, finger_position, thumb_position=None, thumb_rotation=0.5):
         """
         Set hand position with normalized values
         
         Args:
-            position: 0.0 = fingers fully open, 1.0 = fingers fully closed
-            thumb_rotation: 0.0 = outward, 0.5 = neutral, 1.0 = inward
+            finger_position: 0.0 = fingers (DOF 0-3) fully open, 1.0 = fully closed
+            thumb_position: 0.0 = thumb (DOF 4) open, 1.0 = closed. If None, follows finger_position
+            thumb_rotation: 0.0 = outward, 0.5 = neutral, 1.0 = inward (DOF 5)
         """
-        position = np.clip(position, 0.0, 1.0)
+        finger_position = np.clip(finger_position, 0.0, 1.0)
         thumb_rotation = np.clip(thumb_rotation, 0.0, 1.0)
         
+        # If thumb_position not specified, follow fingers
+        if thumb_position is None:
+            thumb_position = finger_position
+        else:
+            thumb_position = np.clip(thumb_position, 0.0, 1.0)
+        
         # Map 0.0-1.0 to ANGLE_MAX-ANGLE_MIN (inverted: 0.0=open=2000, 1.0=closed=0)
-        finger_angle = self.ANGLE_MAX - (position * (self.ANGLE_MAX - self.ANGLE_MIN))
+        finger_angle = self.ANGLE_MAX - (finger_position * (self.ANGLE_MAX - self.ANGLE_MIN))
         angles = np.full(self.NUM_DOFS, finger_angle, dtype=np.int16)
         
+        # Thumb bend (DOF 4): separate control with lag support
+        thumb_bend_angle = self.ANGLE_MAX - (thumb_position * (self.ANGLE_MAX - self.ANGLE_MIN))
+        angles[4] = int(thumb_bend_angle)
+        
         # Thumb rotation (DOF 5): 0=outward(2000), 0.5=neutral(1000), 1=inward(0)
-        thumb_angle = self.ANGLE_MAX - (thumb_rotation * (self.ANGLE_MAX - self.ANGLE_MIN))
-        angles[5] = int(thumb_angle)
+        thumb_rot_angle = self.ANGLE_MAX - (thumb_rotation * (self.ANGLE_MAX - self.ANGLE_MIN))
+        angles[5] = int(thumb_rot_angle)
         
         return self.set_angles(angles)
     
@@ -332,19 +343,22 @@ class DualHandController:
         
         print("[INSPIRE] ✓ Inspire hands initialized")
     
-    def ctrl_dual_hand(self, left_position, right_position, 
+    def ctrl_dual_hand(self, left_finger_pos, right_finger_pos,
+                        left_thumb_pos=None, right_thumb_pos=None,
                         left_thumb_rotation=0.5, right_thumb_rotation=0.5):
         """
         Control both hands with normalized positions
         
         Args:
-            left_position: 0.0-1.0 (0.0=open, 1.0=closed)
-            right_position: 0.0-1.0 (0.0=open, 1.0=closed)
+            left_finger_pos: 0.0-1.0 (fingers: 0.0=open, 1.0=closed)
+            right_finger_pos: 0.0-1.0 (fingers: 0.0=open, 1.0=closed)
+            left_thumb_pos: 0.0-1.0 (thumb bend: 0.0=open, 1.0=closed). None=follow fingers
+            right_thumb_pos: 0.0-1.0 (thumb bend: 0.0=open, 1.0=closed). None=follow fingers
             left_thumb_rotation: 0.0=outward, 0.5=neutral, 1.0=inward
             right_thumb_rotation: 0.0=outward, 0.5=neutral, 1.0=inward
         """
-        self.left_hand.set_position_normalized(left_position, left_thumb_rotation)
-        self.right_hand.set_position_normalized(right_position, right_thumb_rotation)
+        self.left_hand.set_position_normalized(left_finger_pos, left_thumb_pos, left_thumb_rotation)
+        self.right_hand.set_position_normalized(right_finger_pos, right_thumb_pos, right_thumb_rotation)
     
     def open_both(self):
         """Open both hands"""
