@@ -38,6 +38,11 @@ Thumbs.db
 isaacgym/
 datasets/
 
+# Motion data (large training datasets)
+data/
+twist2/assets/example_motions/
+!twist2/assets/example_motions/*.pkl  # Keep original 10 example files tracked
+
 # Installers
 Miniconda*.sh
 

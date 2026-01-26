@@ -59,18 +59,30 @@ def train(args):
     
     if args.no_wandb:
         mode = "disabled"
+    
+    # Get wandb settings from args
+    wandb_entity = args.wandb_entity if hasattr(args, 'wandb_entity') and args.wandb_entity else None
+    wandb_project = args.wandb_project if hasattr(args, 'wandb_project') else 'twist2_walking'
         
     robot_type = args.task.split("_")[0]
     
-    try:
-        wandb.init(entity="far-wandb", project="twist", name=args.exptid, mode="disabled", dir="../../logs")
-    except:
-        wandb.init(project="g1_mimic", name=args.exptid, mode="disabled", dir="../../logs")
-    # wandb.save(LEGGED_GYM_ENVS_DIR + "/base/legged_robot_config.py", policy="now")
-    # wandb.save(LEGGED_GYM_ENVS_DIR + "/base/legged_robot.py", policy="now")
-    # wandb.save(LEGGED_GYM_ENVS_DIR + "/base/humanoid_config.py", policy="now")
-    # wandb.save(LEGGED_GYM_ENVS_DIR + "/base/humanoid.py", policy="now")
-    if robot_type == "g1":
+    # Initialize wandb with proper mode (online/disabled based on args)
+    print(f"[WandB] Mode: {mode}, Project: {wandb_project}, Entity: {wandb_entity}")
+    wandb.init(
+        entity=wandb_entity,
+        project=wandb_project,
+        name=args.exptid,
+        mode=mode,
+        dir="../../logs",
+        config={
+            "task": args.task,
+            "num_envs": args.num_envs if hasattr(args, 'num_envs') else None,
+            "experiment_id": args.exptid,
+        }
+    )
+    
+    # Save config files to wandb
+    if mode == "online" and robot_type == "g1":
         wandb.save(LEGGED_GYM_ENVS_DIR + "/g1/g1_mimic_distill_config.py", policy="now")
     
     env, _ = task_registry.make_env(name=args.task, args=args)

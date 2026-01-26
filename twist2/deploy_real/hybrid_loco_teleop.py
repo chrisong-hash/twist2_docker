@@ -393,6 +393,14 @@ class HybridLocoTeleop:
         self.smooth_window_size = args.smooth_window_size
         self.smooth_history = []  # Store recent observations for sliding window
         
+        # Velocity scaling (to match GROOT's intended walking speed range)
+        # GROOT uses raw commands ~0.2-0.4, which after cmd_scale [2.0, 2.0, 0.5] gives reasonable speeds
+        # Without scaling, joystick at 1.0 would give 2.0 m/s - way too fast!
+        self.vel_scale_forward = args.vel_scale_forward   # Max ~0.6 m/s forward
+        self.vel_scale_backward = args.vel_scale_backward # Max ~0.4 m/s backward (more conservative)
+        self.vel_scale_strafe = args.vel_scale_strafe     # Max ~0.5 m/s strafe
+        self.vel_scale_yaw = args.vel_scale_yaw           # Max ~0.2 rad/s yaw
+        
         # Inspire hands (toggle: 0=open, 1=closed)
         self.hand_controller = None
         self._left_hand_closed = False   # Toggle state
@@ -414,6 +422,15 @@ class HybridLocoTeleop:
             print(f"[cyan]Smooth filtering: ENABLED (window size: {self.smooth_window_size} frames)[/cyan]")
         else:
             print("[yellow]Smooth filtering: DISABLED[/yellow]")
+        
+        # Print velocity scaling info
+        print(f"\n[cyan]Velocity scaling (for GROOT GearWBC compatibility):[/cyan]")
+        print(f"  Forward:  {self.vel_scale_forward:.2f} → max {self.vel_scale_forward * 2.0:.1f} m/s")
+        print(f"  Backward: {self.vel_scale_backward:.2f} → max {self.vel_scale_backward * 2.0:.1f} m/s")
+        print(f"  Strafe:   {self.vel_scale_strafe:.2f} → max {self.vel_scale_strafe * 2.0:.1f} m/s")
+        print(f"  Yaw:      {self.vel_scale_yaw:.2f} → max {self.vel_scale_yaw * 0.5:.2f} rad/s")
+        print(f"  [yellow]Tune with --vel_scale_forward, --vel_scale_backward, etc.[/yellow]")
+        
         self._print_controls()
     
     def _setup_locomotion_policy(self):
@@ -789,11 +806,20 @@ class HybridLocoTeleop:
         right_axis = right_ctrl.get("axis", [0, 0])
         
         if self.state == "teleop" and self.locomotion_active:
-            # Left joystick for movement
-            self.vel_cmd[0] = left_axis[1] if len(left_axis) > 1 else 0.0   # forward/backward
-            self.vel_cmd[1] = -left_axis[0] if len(left_axis) > 0 else 0.0  # strafe
-            # Right joystick for rotation
-            self.vel_cmd[2] = -right_axis[0] if len(right_axis) > 0 else 0.0  # yaw
+            # Left joystick for movement (with velocity scaling for GROOT compatibility)
+            # GROOT policy expects raw commands in ~0.2-0.4 range, not 0-1
+            raw_forward = left_axis[1] if len(left_axis) > 1 else 0.0
+            raw_strafe = -left_axis[0] if len(left_axis) > 0 else 0.0
+            raw_yaw = -right_axis[0] if len(right_axis) > 0 else 0.0
+            
+            # Apply asymmetric scaling for forward vs backward (backward is less stable)
+            if raw_forward >= 0:
+                self.vel_cmd[0] = raw_forward * self.vel_scale_forward
+            else:
+                self.vel_cmd[0] = raw_forward * self.vel_scale_backward
+            
+            self.vel_cmd[1] = raw_strafe * self.vel_scale_strafe
+            self.vel_cmd[2] = raw_yaw * self.vel_scale_yaw
         else:
             # Zero velocity when not in locomotion mode
             self.vel_cmd[:] = 0.0
@@ -1203,6 +1229,15 @@ def parse_args():
     parser.add_argument("--no_inspire_hands", action="store_true", help="Disable Inspire hand control")
     parser.add_argument("--inspire_left_ip", type=str, default="192.168.123.210", help="Left Inspire hand IP")
     parser.add_argument("--inspire_right_ip", type=str, default="192.168.123.211", help="Right Inspire hand IP")
+    # Velocity scaling arguments (to match GROOT's intended speed range)
+    parser.add_argument("--vel_scale_forward", type=float, default=0.3, 
+                        help="Max forward velocity scale (default: 0.3, gives ~0.6 m/s after cmd_scale)")
+    parser.add_argument("--vel_scale_backward", type=float, default=0.2,
+                        help="Max backward velocity scale (default: 0.2, more conservative for stability)")
+    parser.add_argument("--vel_scale_strafe", type=float, default=0.25,
+                        help="Max strafe velocity scale (default: 0.25)")
+    parser.add_argument("--vel_scale_yaw", type=float, default=0.4,
+                        help="Max yaw rotation scale (default: 0.4, gives ~0.2 rad/s after cmd_scale)")
     return parser.parse_args()
 
 

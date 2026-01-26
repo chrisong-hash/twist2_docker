@@ -334,7 +334,8 @@ class G1MimicPrivCfg(HumanoidMimicCfg):
         motion_smooth = True
         motion_decompose = False
 
-        motion_file = f"{LEGGED_GYM_ROOT_DIR}/motion_data_configs/example_motions.yaml"
+        # motion_file = f"{LEGGED_GYM_ROOT_DIR}/motion_data_configs/example_motions.yaml"  # Original 10 clips
+        motion_file = f"{LEGGED_GYM_ROOT_DIR}/motion_data_configs/walking_focused.yaml"  # Pruned 2124 clips with backward walking
         
 
 

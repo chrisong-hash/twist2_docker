@@ -313,11 +313,15 @@ class OnPolicyRunner:
         wandb_dict['Perf/collection time'] = locs['collection_time']
         wandb_dict['Perf/learning_time'] = locs['learn_time']
         if len(locs['rewbuffer']) > 0:
-            wandb_dict['Train/mean_reward'] = statistics.mean(locs['rewbuffer'])
+            mean_reward = statistics.mean(locs['rewbuffer'])
+            mean_ep_length = statistics.mean(locs['lenbuffer'])
+            wandb_dict['Train/mean_reward'] = mean_reward
             # wandb_dict['Train/mean_reward_explr'] = statistics.mean(locs['rew_explr_buffer'])
             # wandb_dict['Train/mean_reward_task'] = statistics.mean(locs['task_rew_buf'])
             # wandb_dict['Train/mean_reward_entropy'] = statistics.mean(locs['rew_entropy_buffer'])
-            wandb_dict['Train/mean_episode_length'] = statistics.mean(locs['lenbuffer'])
+            wandb_dict['Train/mean_episode_length'] = mean_ep_length
+            # Per-step reward: useful for comparing across different episode lengths
+            wandb_dict['Train/mean_reward_per_step'] = mean_reward / mean_ep_length if mean_ep_length > 0 else 0
             # wandb_dict['Train/mean_reward/time', statistics.mean(locs['rewbuffer']), self.tot_time)
             # wandb_dict['Train/mean_episode_length/time', statistics.mean(locs['lenbuffer']), self.tot_time)
 

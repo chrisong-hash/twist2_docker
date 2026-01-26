@@ -71,13 +71,13 @@ start_peripherals() {
     
     # Kill any existing peripheral process
     echo "    Killing existing processes..."
-    ssh -n ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} 'pkill -f robot_peripherals.py 2>/dev/null; exit 0'
+    ssh -n ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} 'pkill -f robot_peripherals.py 2>/dev/null; pkill -f run_peripherals.sh 2>/dev/null; exit 0'
     sleep 1
     
-    # Start peripherals with logging
+    # Start peripherals via run_peripherals.sh (reads neck_config.json for calibration)
     echo "    Launching peripheral script (video + neck)..."
     LOG_FILE="peripheral_\$(date +%Y%m%d_%H%M%S).log"
-    ssh -f ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} "cd ~ && python3 robot_peripherals.py --redis ${PC_IP} > ~/logs/${LOG_FILE} 2>&1"
+    ssh -f ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} "cd ~ && REDIS_HOST=${PC_IP} ./run_peripherals.sh > ~/logs/${LOG_FILE} 2>&1"
     
     sleep 3
     
@@ -95,7 +95,7 @@ start_peripherals() {
 stop_peripherals() {
     echo ""
     echo "[3/3] Stopping peripherals on robot..."
-    ssh -n ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} 'pkill -f robot_peripherals.py 2>/dev/null; exit 0' || true
+    ssh -n ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} 'pkill -f robot_peripherals.py 2>/dev/null; pkill -f run_peripherals.sh 2>/dev/null; exit 0' || true
     echo "[✓] Peripherals stopped"
 }
 
@@ -116,7 +116,7 @@ trap cleanup EXIT
 
 # Clear stale Redis keys from previous sessions
 echo "Clearing stale Redis keys..."
-redis-cli DEL teleop_state_info loco_vel_cmd sim2real_ready > /dev/null 2>&1
+redis-cli DEL action_body_unitree_g1_with_hands action_hand_left_unitree_g1_with_hands action_hand_right_unitree_g1_with_hands action_neck_unitree_g1_with_hands teleop_state_info loco_vel_cmd t_action sim2real_ready > /dev/null 2>&1
 echo "Redis keys cleared."
 echo ""
 

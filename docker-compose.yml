@@ -38,6 +38,9 @@ services:
       - ./unitree_sdk2:/workspace/unitree_sdk2
       - ./GMR:/workspace/GMR
       
+      # Training data (motion capture datasets)
+      - ./data:/workspace/data:ro
+      
       # RoboMimic for hybrid locomotion
       - /home/robo/CodeSpace/RoboMimic_Deploy:/workspace/RoboMimic_Deploy:ro
 

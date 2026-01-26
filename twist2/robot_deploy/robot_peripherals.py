@@ -90,10 +90,13 @@ PITCH_RANGE_UP = 50     # ~4.4 degrees up (limited by physical min 1630)
 PITCH_RANGE_DOWN = 800  # ~70 degrees down (physical max allows 982)
 
 # Absolute physical limits (safety clamps)
-YAW_ABS_MIN = 330
-YAW_ABS_MAX = 1970
-PITCH_ABS_MIN = 1630
-PITCH_ABS_MAX = 2667
+# For your robot with center at 3064/3700:
+# YAW range: 2536 (left) to 3573 (right)
+# PITCH range: 3581 (up) to 4405 (down)
+YAW_ABS_MIN = 2200    # Safety margin below left limit
+YAW_ABS_MAX = 3900    # Safety margin above right limit
+PITCH_ABS_MIN = 3300  # Safety margin below up limit
+PITCH_ABS_MAX = 4700  # Safety margin above down limit
 
 # ============== Globals ==============
 running = True
@@ -538,24 +541,33 @@ class NeckController:
         for motor_id in [ID_YAW, ID_PITCH]:
             name = "YAW" if motor_id == ID_YAW else "PITCH"
             
-            # Reboot motor to clear any errors
-            self.packet_handler.reboot(self.port_handler, motor_id)
-            time.sleep(0.3)  # Wait for reboot
+            # Check for hardware errors and reboot ONLY at startup to clear them
+            hw_err, result, _ = self.packet_handler.read1ByteTxRx(self.port_handler, motor_id, ADDR_HARDWARE_ERROR)
+            if result == 0 and hw_err != 0:
+                print(f"[Neck] {name} (ID {motor_id}): Hardware error 0x{hw_err:02X} - rebooting to clear...")
+                self.packet_handler.reboot(self.port_handler, motor_id)
+                time.sleep(0.5)
             
-            # Set operating mode (returns result, error)
+            # Disable torque (REQUIRED before changing operating mode)
+            self.packet_handler.write1ByteTxRx(self.port_handler, motor_id, ADDR_TORQUE_ENABLE, 0)
+            time.sleep(0.1)
+            
+            # Set operating mode to Position Control (mode 3)
             result, err = self.packet_handler.write1ByteTxRx(self.port_handler, motor_id, ADDR_OPERATING_MODE, 3)
             if result != 0:
                 print(f"[Neck] {name} (ID {motor_id}): Failed to set mode (err={result})")
             
-            # Set velocity
-            self.packet_handler.write4ByteTxRx(self.port_handler, motor_id, ADDR_PROFILE_VELOCITY, 100)
+            # Set profile velocity for smooth motion
+            self.packet_handler.write4ByteTxRx(self.port_handler, motor_id, ADDR_PROFILE_VELOCITY, 200)
             
             # Enable torque
             result, err = self.packet_handler.write1ByteTxRx(self.port_handler, motor_id, ADDR_TORQUE_ENABLE, 1)
             if result != 0:
                 print(f"[Neck] {name} (ID {motor_id}): Failed to enable torque (err={result})")
+            else:
+                print(f"[Neck] {name} (ID {motor_id}): Torque enabled")
             
-            # Read current position (returns value, result, error)
+            # Read current position
             pos, result, err = self.packet_handler.read4ByteTxRx(self.port_handler, motor_id, ADDR_PRESENT_POSITION)
             if result == 0:
                 print(f"[Neck] {name} (ID {motor_id}): OK, current pos={pos}")
@@ -590,6 +602,13 @@ class NeckController:
         yaw_pos = max(YAW_ABS_MIN, min(YAW_ABS_MAX, yaw_pos))
         pitch_pos = max(PITCH_ABS_MIN, min(PITCH_ABS_MAX, pitch_pos))
         
+        # DEBUG: Log AFTER clamping
+        if not hasattr(self, '_cmd_count'):
+            self._cmd_count = 0
+        self._cmd_count += 1
+        if self._cmd_count <= 10 or self._cmd_count % 100 == 0:
+            print(f"[Neck DEBUG] cmd#{self._cmd_count}: yaw_rad={yaw_rad:.4f} pitch_rad={pitch_rad:.4f} -> SENDING yaw={yaw_pos} pitch={pitch_pos}")
+        
         # Write to YAW motor with error checking
         yaw_result, yaw_err = self.packet_handler.write4ByteTxRx(self.port_handler, ID_YAW, ADDR_GOAL_POSITION, yaw_pos)
         if yaw_result != 0:
@@ -601,9 +620,30 @@ class NeckController:
         if pitch_result != 0:
             print(f"[Neck] PITCH write error: result={pitch_result}, err={pitch_err}")
             self._check_motor_error(ID_PITCH, "PITCH")
+        
+        # Verify FIRST FEW commands immediately (to debug the swing issue)
+        if hasattr(self, '_cmd_count') and self._cmd_count <= 5:
+            time.sleep(0.1)  # Give motor time to move
+            actual_yaw, _, _ = self.packet_handler.read4ByteTxRx(self.port_handler, ID_YAW, ADDR_PRESENT_POSITION)
+            actual_pitch, _, _ = self.packet_handler.read4ByteTxRx(self.port_handler, ID_PITCH, ADDR_PRESENT_POSITION)
+            print(f"[Neck VERIFY] cmd#{self._cmd_count}: sent=({yaw_pos},{pitch_pos}) actual=({actual_yaw},{actual_pitch})")
+        
+        # Periodically verify motors are following commands
+        if hasattr(self, '_cmd_count') and self._cmd_count % 50 == 0:
+            # Read actual positions
+            actual_yaw, _, _ = self.packet_handler.read4ByteTxRx(self.port_handler, ID_YAW, ADDR_PRESENT_POSITION)
+            actual_pitch, _, _ = self.packet_handler.read4ByteTxRx(self.port_handler, ID_PITCH, ADDR_PRESENT_POSITION)
+            yaw_error = abs(actual_yaw - yaw_pos)
+            pitch_error = abs(actual_pitch - pitch_pos)
+            # Warn if position error > 100 ticks (~9 degrees)
+            if yaw_error > 100 or pitch_error > 100:
+                print(f"[Neck] ⚠️  POSITION ERROR! cmd=({yaw_pos},{pitch_pos}) actual=({actual_yaw},{actual_pitch}) error=({yaw_error},{pitch_error})")
+                # Check for hardware errors
+                self._check_motor_error(ID_YAW, "YAW")
+                self._check_motor_error(ID_PITCH, "PITCH")
     
     def _check_motor_error(self, motor_id, name):
-        """Check and print hardware error status for a motor, attempt recovery"""
+        """Check and print hardware error status for a motor (no reboot - that causes position jump!)"""
         hw_err, result, _ = self.packet_handler.read1ByteTxRx(self.port_handler, motor_id, ADDR_HARDWARE_ERROR)
         if result == 0:
             if hw_err != 0:
@@ -614,14 +654,11 @@ class NeckController:
                 if hw_err & 0x10: errors.append("Electrical Shock")
                 if hw_err & 0x20: errors.append("Overload")
                 print(f"[Neck] {name} HARDWARE ERROR: 0x{hw_err:02X} ({', '.join(errors) if errors else 'unknown'})")
-                print(f"[Neck] {name} attempting auto-recovery...")
-                self._recover_motor(motor_id, name)
+                # DON'T reboot - just log the error
             else:
-                print(f"[Neck] {name} no hardware error, check connection")
+                print(f"[Neck] {name} no hardware error")
         else:
-            print(f"[Neck] {name} cannot read error status (motor disconnected?)")
-            print(f"[Neck] {name} attempting auto-recovery...")
-            self._recover_motor(motor_id, name)
+            print(f"[Neck] {name} cannot read error status")
     
     def _recover_motor(self, motor_id, name):
         """Attempt to recover a motor by rebooting it"""
@@ -632,7 +669,7 @@ class NeckController:
             
             # Re-configure motor
             self.packet_handler.write1ByteTxRx(self.port_handler, motor_id, ADDR_OPERATING_MODE, 3)
-            self.packet_handler.write4ByteTxRx(self.port_handler, motor_id, ADDR_PROFILE_VELOCITY, 100)
+            self.packet_handler.write4ByteTxRx(self.port_handler, motor_id, ADDR_PROFILE_VELOCITY, 200)  # Faster response
             result, _ = self.packet_handler.write1ByteTxRx(self.port_handler, motor_id, ADDR_TORQUE_ENABLE, 1)
             
             if result == 0:
@@ -644,6 +681,8 @@ class NeckController:
     
     def center(self):
         if self.connected:
+            print(f"[Neck] Moving to CENTER: yaw={self.yaw_center}, pitch={self.pitch_center}")
+            # Just send the center position - don't reboot motors (reboot causes position jump)
             self.packet_handler.write4ByteTxRx(self.port_handler, ID_YAW, ADDR_GOAL_POSITION, self.yaw_center)
             self.packet_handler.write4ByteTxRx(self.port_handler, ID_PITCH, ADDR_GOAL_POSITION, self.pitch_center)
     
@@ -662,7 +701,41 @@ class NeckController:
             print(f"[Neck] Cannot connect to Redis at {redis_host}")
             return
         
+        # Clear any stale neck data from previous sessions
+        r.delete('action_neck_unitree_g1_with_hands')
+        print("[Neck] Cleared stale neck data from Redis")
+        
         self.center()
+        time.sleep(0.5)
+        
+        # VERIFY center command worked
+        actual_yaw, _, _ = self.packet_handler.read4ByteTxRx(self.port_handler, ID_YAW, ADDR_PRESENT_POSITION)
+        actual_pitch, _, _ = self.packet_handler.read4ByteTxRx(self.port_handler, ID_PITCH, ADDR_PRESENT_POSITION)
+        print(f"[Neck] After CENTER: actual=({actual_yaw}, {actual_pitch}), expected=({self.yaw_center}, {self.pitch_center})")
+        
+        # TEST: Send one tracking-like command and verify
+        test_yaw = self.yaw_center + 100  # 100 ticks right
+        test_pitch = self.pitch_center + 50  # 50 ticks down
+        print(f"[Neck] TEST: Sending yaw={test_yaw}, pitch={test_pitch}")
+        self.packet_handler.write4ByteTxRx(self.port_handler, ID_YAW, ADDR_GOAL_POSITION, test_yaw)
+        self.packet_handler.write4ByteTxRx(self.port_handler, ID_PITCH, ADDR_GOAL_POSITION, test_pitch)
+        time.sleep(0.5)
+        actual_yaw, _, _ = self.packet_handler.read4ByteTxRx(self.port_handler, ID_YAW, ADDR_PRESENT_POSITION)
+        actual_pitch, _, _ = self.packet_handler.read4ByteTxRx(self.port_handler, ID_PITCH, ADDR_PRESENT_POSITION)
+        yaw_err = actual_yaw - test_yaw
+        pitch_err = actual_pitch - test_pitch
+        if abs(yaw_err) > 50 or abs(pitch_err) > 50:
+            print(f"[Neck] TEST FAILED! actual=({actual_yaw}, {actual_pitch}), error=({yaw_err}, {pitch_err})")
+        else:
+            print(f"[Neck] TEST PASSED: actual=({actual_yaw}, {actual_pitch}), error=({yaw_err}, {pitch_err})")
+        
+        # Return to center and WAIT for it to complete
+        self.center()
+        time.sleep(1.0)  # Full second to ensure motor reaches center
+        actual_yaw, _, _ = self.packet_handler.read4ByteTxRx(self.port_handler, ID_YAW, ADDR_PRESENT_POSITION)
+        actual_pitch, _, _ = self.packet_handler.read4ByteTxRx(self.port_handler, ID_PITCH, ADDR_PRESENT_POSITION)
+        print(f"[Neck] Ready to track: position=({actual_yaw}, {actual_pitch})")
+        
         last_yaw, last_pitch = 0.0, 0.0
         
         # Redis watchdog

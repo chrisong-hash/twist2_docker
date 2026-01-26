@@ -49,6 +49,14 @@ target_fps=50
 inspire_left_ip="192.168.123.210"
 inspire_right_ip="192.168.123.211"
 
+# Velocity scaling for GROOT GearWBC (adjust to taste)
+# Lower values = slower walking, higher = faster
+# After cmd_scale [2.0, 2.0, 0.5]: actual speed = scale * 2.0 m/s (or * 0.5 for yaw)
+vel_scale_forward=0.3    # 0.3 → max 0.6 m/s forward
+vel_scale_backward=0.1   # 0.1 → max 0.2 m/s backward (very conservative for stability)
+vel_scale_strafe=0.25    # 0.25 → max 0.5 m/s strafe
+vel_scale_yaw=0.4        # 0.4 → max 0.2 rad/s yaw
+
 echo ""
 echo "============================================================"
 echo "  HYBRID TELEOP - Full Robot Control"
@@ -107,7 +115,11 @@ python teleop_hybrid.py \
     --smooth --smooth_window_size 4 \
     --use_inspire_hands \
     --inspire_left_ip $inspire_left_ip \
-    --inspire_right_ip $inspire_right_ip
+    --inspire_right_ip $inspire_right_ip \
+    --vel_scale_forward $vel_scale_forward \
+    --vel_scale_backward $vel_scale_backward \
+    --vel_scale_strafe $vel_scale_strafe \
+    --vel_scale_yaw $vel_scale_yaw
 
 echo ""
 echo "Hybrid teleop stopped."

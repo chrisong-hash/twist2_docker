@@ -283,7 +283,8 @@ def get_args():
         {"name": "--proj_name", "type": str,  "default": "h1", "help": "run folder name."},
         
         {"name": "--exptid", "type": str, "help": "exptid"},
-        {"name": "--entity", "type": str, "default": "", "help": "wandb entity"},
+        {"name": "--wandb_entity", "type": str, "default": None, "help": "WandB entity (username or team name)"},
+        {"name": "--wandb_project", "type": str, "default": "twist2_walking", "help": "WandB project name"},
         {"name": "--resumeid", "type": str, "help": "exptid"},
 
         {"name": "--use_jit", "action": "store_true", "default": False, "help": "Load jit script when playing"},

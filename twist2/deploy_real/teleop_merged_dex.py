@@ -596,6 +596,9 @@ class MergedTeleopDex:
     
     INTERP_DURATION = 0.25
     
+    # Auto-balance on backward stop: when backward walking stops, auto-switch to balance mode
+    BACKWARD_STOP_THRESHOLD = 0.05  # velocity below this = stopped
+    
     DEFAULT_STANDING_LEGS = np.array([
         -0.2, 0.0, 0.0, 0.42, -0.23, 0.0,
         -0.2, 0.0, 0.0, 0.42, -0.23, 0.0,
@@ -635,6 +638,9 @@ class MergedTeleopDex:
         self.hands_paused = False
         self.frozen_arm_obs = None
         self._capture_frozen_arms = False  # Flag to capture arm positions on next frame
+        
+        # Auto-balance on backward stop
+        self._was_walking_backward = False  # Track if we were walking backward
         
         # Inspire hands
         self.use_inspire_hands = getattr(args, 'use_inspire_hands', False)
@@ -747,6 +753,14 @@ class MergedTeleopDex:
                 timeout=3.0,
                 async_mode=True
             )
+            
+            # Set force limit to prevent fingers getting stuck
+            # Range: 0-3000 (per Inspire manual), lower = softer grip
+            # Manual example uses 300 for soft, recommended: 500-800
+            force_limit = getattr(self.args, 'hand_force_limit', 500)
+            print(f"  → Setting force limit to {force_limit}...")
+            self.inspire_hand_controller.set_force_limit(force_limit)
+            time.sleep(0.3)
             
             # Test sequence - open/close/open to verify connectivity
             print("  Testing hands...")
@@ -930,6 +944,25 @@ class MergedTeleopDex:
             alpha = min(1.0, elapsed / self.INTERP_DURATION)
             return alpha > 0.5  # Enable after halfway through interpolation
         return False
+    
+    def _check_auto_balance_on_backward_stop(self, current_qpos):
+        """
+        Auto-transition to balance mode when backward walking stops.
+        Similar to pressing A+Y - gives robot time to stabilize.
+        """
+        if not self._is_locomotion_active() or self.is_interpolating:
+            self._was_walking_backward = False
+            return
+        
+        # Check backward velocity (negative vel_cmd[0] = walking backward)
+        is_walking_backward = self.vel_cmd[0] < -self.BACKWARD_STOP_THRESHOLD
+        
+        # Detect transition: was walking backward, now stopped
+        if self._was_walking_backward and not is_walking_backward:
+            print("\n[yellow]→ Backward walk stopped, auto-switching to BALANCE mode[/yellow]")
+            self._start_interpolation("teleop_loco", "teleop_full", current_qpos)
+        
+        self._was_walking_backward = is_walking_backward
     
     def _send_velocity_command_only(self):
         """Send only velocity command to Redis (called every loop in teleop mode)"""
@@ -1311,6 +1344,9 @@ class MergedTeleopDex:
                         # In locomotion mode: legs + waist at LocoMode default
                         qpos[7:7+12] = self.loco_policy.default_angles_reorder[:12]  # Legs
                         qpos[7+12:7+15] = self.loco_policy.default_angles_reorder[12:15]  # Waist
+                        
+                        # Auto-balance: switch to balance mode when backward walking stops
+                        self._check_auto_balance_on_backward_stop(qpos)
                     
                     # Update MuJoCo visualization
                     self.data.qpos[:] = qpos
@@ -1332,8 +1368,8 @@ class MergedTeleopDex:
                     mimic_obs = self.apply_smooth(mimic_obs)
                     
                     if mimic_obs is not None:
-                        # ANTI-ROTATION: Force waist_yaw (index 20) to 0
-                        mimic_obs[20] = 0.0
+                        # TWIST2 behavior: Let body rotation pass through from retargeting
+                        # (No waist_yaw lock - robot follows human torso rotation)
                         
                         # Upper body freeze: capture arm positions on request
                         if self._capture_frozen_arms:
@@ -1345,13 +1381,19 @@ class MergedTeleopDex:
                         if self.hands_paused and self.frozen_arm_obs is not None:
                             mimic_obs[21:35] = self.frozen_arm_obs
                         
-                        # === YAW CONTROL ===
+                        # === YAW CONTROL (TWIST2 behavior) ===
+                        # teleop_full: Let yaw velocity pass through from body tracking
+                        # teleop_loco: Use joystick for yaw (walking mode)
+                        # paused/other: Lock to 0
                         effective_state = self.interp_to_state if self.is_interpolating else self.state
                         if effective_state == "teleop_full":
-                            mimic_obs[5] = 0.0
+                            # TWIST2: Natural yaw from body tracking (no modification)
+                            pass
                         elif effective_state == "teleop_loco":
+                            # Walking: joystick controls yaw
                             mimic_obs[5] = self.vel_cmd[2]
                         else:
+                            # Paused/idle: no rotation
                             mimic_obs[5] = 0.0
                     
                     # Get neck data from body tracking (uses Spine3 and Head joints)
@@ -1415,6 +1457,8 @@ def parse_args():
     parser.add_argument("--use_inspire_hands", action="store_true", help="Enable Inspire hands")
     parser.add_argument("--inspire_left_ip", type=str, default="192.168.123.210", help="Left Inspire hand IP")
     parser.add_argument("--inspire_right_ip", type=str, default="192.168.123.211", help="Right Inspire hand IP")
+    parser.add_argument("--hand_force_limit", type=int, default=500, 
+                        help="Inspire hand force limit (0-3000). Lower=softer grip, prevents stuck fingers. 300=soft, 500-800=normal, 3000=max. Default: 500")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     return parser.parse_args()
 
@@ -1426,4 +1470,3 @@ if __name__ == "__main__":
         teleop.run()
     except KeyboardInterrupt:
         print("\n[yellow]Interrupted[/yellow]")
-

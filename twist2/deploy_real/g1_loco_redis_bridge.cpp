@@ -137,9 +137,9 @@ public:
         , network_interface_(network_interface)
         , redis_context_(nullptr)
         , control_dt_(0.02)  // 50 Hz
-        , max_forward_speed_(0.8f)
-        , max_lateral_speed_(0.5f)
-        , max_turn_speed_(0.8f)
+        , max_forward_speed_(0.3f)  // Reduced from 0.8 for safety
+        , max_lateral_speed_(0.2f)  // Reduced from 0.5 for safety
+        , max_turn_speed_(0.4f)     // Reduced from 0.8 for safety
         , sprint_multiplier_(2.0f)
         , is_sprinting_(false)
         , b_button_prev_(false)
@@ -155,6 +155,13 @@ public:
 
     ~LocoRedisBridge() {
         cleanup();
+    }
+    
+    void setMaxSpeeds(float forward, float lateral, float turn) {
+        max_forward_speed_ = forward;
+        max_lateral_speed_ = lateral;
+        max_turn_speed_ = turn;
+        std::cout << "Max speeds: forward=" << forward << " m/s, lateral=" << lateral << " m/s, turn=" << turn << " rad/s" << std::endl;
     }
 
     bool init() {
@@ -476,6 +483,9 @@ int main(int argc, char* argv[]) {
     std::string redis_ip = "localhost";
     int redis_port = 6379;
     std::string network_interface = "enp4s0";
+    float max_forward = 0.3f;
+    float max_lateral = 0.2f;
+    float max_turn = 0.4f;
     
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -485,12 +495,21 @@ int main(int argc, char* argv[]) {
             redis_port = std::stoi(argv[++i]);
         } else if (arg == "--network_interface" && i + 1 < argc) {
             network_interface = argv[++i];
+        } else if (arg == "--max_forward_speed" && i + 1 < argc) {
+            max_forward = std::stof(argv[++i]);
+        } else if (arg == "--max_lateral_speed" && i + 1 < argc) {
+            max_lateral = std::stof(argv[++i]);
+        } else if (arg == "--max_turn_speed" && i + 1 < argc) {
+            max_turn = std::stof(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [options]" << std::endl;
             std::cout << "Options:" << std::endl;
             std::cout << "  --redis_ip <ip>              Redis server IP (default: localhost)" << std::endl;
             std::cout << "  --redis_port <port>          Redis server port (default: 6379)" << std::endl;
             std::cout << "  --network_interface <iface>  Network interface (default: enp4s0)" << std::endl;
+            std::cout << "  --max_forward_speed <speed>  Max forward speed m/s (default: 0.3)" << std::endl;
+            std::cout << "  --max_lateral_speed <speed>  Max lateral speed m/s (default: 0.2)" << std::endl;
+            std::cout << "  --max_turn_speed <speed>     Max turn speed rad/s (default: 0.4)" << std::endl;
             std::cout << "  --help, -h                   Show this help message" << std::endl;
             return 0;
         }
@@ -499,6 +518,7 @@ int main(int argc, char* argv[]) {
     // Create and run bridge
     std::cout << "Note: Press A button on controller to exit" << std::endl;
     LocoRedisBridge bridge(redis_ip, redis_port, network_interface);
+    bridge.setMaxSpeeds(max_forward, max_lateral, max_turn);
     
     if (!bridge.init()) {
         std::cerr << "Failed to initialize bridge!" << std::endl;

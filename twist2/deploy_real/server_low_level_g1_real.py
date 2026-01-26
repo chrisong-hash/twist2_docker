@@ -333,6 +333,13 @@ class RealTimePolicyController(object):
             print(f"Body action smoothing enabled with alpha={smooth_body}")
         else:
             self.body_smoother = None
+        
+        # Velocity command smoothing for GearWBC (like GROOT's InterpolationPolicy)
+        # This provides smooth velocity transitions instead of abrupt joystick changes
+        # alpha=0.3 gives responsive but smooth transitions (~3 frames to reach target)
+        if hybrid_loco_mode:
+            self.vel_cmd_smoother = EMASmoother(alpha=0.3)
+            print("[GearWBC] Velocity command smoothing ENABLED (alpha=0.3)")
 
         
     def reset_robot(self):
@@ -440,14 +447,18 @@ class RealTimePolicyController(object):
                 
                 # Check if teleop data is available (keys may not exist yet)
                 if redis_results[0] is None:
-                    # No teleop data yet - hold default standing position
-                    self.env.send_robot_action(self.default_dof_pos)
-                    elapsed = time.time() - t_start
-                    if elapsed < self.control_dt:
-                        time.sleep(self.control_dt - elapsed)
-                    continue
-                
-                action_mimic = json.loads(redis_results[0])
+                    # No teleop data yet - use default standing pose as target
+                    # This lets the policy stabilize the robot in standing position
+                    # Format: [vel_x, vel_y, height, roll, pitch, yaw_vel, joint_angles(29)]
+                    STANDING_HEIGHT = 0.74  # G1 robot standing height in meters
+                    action_mimic = np.concatenate([
+                        np.array([0.0, 0.0], dtype=np.float32),  # vel_xy = 0 (stationary)
+                        np.array([STANDING_HEIGHT], dtype=np.float32),  # height = 0.74m (standing)
+                        np.array([0.0, 0.0, 0.0], dtype=np.float32),  # roll=0, pitch=0, yaw_vel=0
+                        self.default_dof_pos  # 29 joint angles from config
+                    ]).tolist()
+                else:
+                    action_mimic = json.loads(redis_results[0])
                 action_hand_left = json.loads(redis_results[1]) if redis_results[1] else [0.0] * 7
                 action_hand_right = json.loads(redis_results[2]) if redis_results[2] else [0.0] * 7
                 action_neck = json.loads(redis_results[3]) if redis_results[3] else [0.0, 0.0]
@@ -509,9 +520,16 @@ class RealTimePolicyController(object):
                     # Read velocity command from Redis
                     vel_cmd_str = self.redis_client.get("loco_vel_cmd")
                     if vel_cmd_str:
-                        vel_cmd = np.array(json.loads(vel_cmd_str), dtype=np.float32)
+                        vel_cmd_raw = np.array(json.loads(vel_cmd_str), dtype=np.float32)
                     else:
-                        vel_cmd = np.zeros(3, dtype=np.float32)
+                        vel_cmd_raw = np.zeros(3, dtype=np.float32)
+                    
+                    # Apply velocity command smoothing (like GROOT's InterpolationPolicy)
+                    # This prevents abrupt velocity changes that can destabilize the robot
+                    if hasattr(self, 'vel_cmd_smoother'):
+                        vel_cmd = self.vel_cmd_smoother.smooth(vel_cmd_raw)
+                    else:
+                        vel_cmd = vel_cmd_raw
                     
                     # Use locomotion policy if locomotion_active OR state == "teleop_loco"
                     use_locomode = (locomotion_active or teleop_state == "teleop_loco") and not in_startup_grace
@@ -536,10 +554,56 @@ class RealTimePolicyController(object):
                     if use_locomode:
                         # LOCOMOTION MODE: Use GearWBC or LocoMode for lower body
                         if getattr(self, 'use_gear_wbc', False):
+                            # === TORSO ORIENTATION COMPENSATION (like GROOT does) ===
+                            # Extract waist angles from mimic_obs to tell policy about upper body pose
+                            # This helps the policy compensate for CoM shifts from arm movements
+                            # mimic_obs structure: [vel_xy(2), height(1), roll_pitch(2), yaw_vel(1), joints(29)]
+                            # Waist joints in mimic_obs: index 18=yaw, 19=pitch, 20=roll
+                            # Arm joints in mimic_obs: index 21-27=left arm, 28-34=right arm
+                            # GearWBC expects torso_rpy as [roll, pitch, yaw]
+                            torso_rpy = None
+                            if len(action_mimic) >= 35:  # Make sure we have waist + arm angles
+                                waist_yaw = action_mimic[18]    # waist yaw from target pose
+                                waist_pitch = action_mimic[19]  # waist pitch
+                                waist_roll = action_mimic[20]   # waist roll
+                                
+                                # Detect arm position and add forward pitch compensation
+                                # When arms are at side (shoulder pitch ~0), CoM shifts backward
+                                # When arms are in front (shoulder pitch < -0.3), CoM shifts forward
+                                # Left shoulder pitch = action_mimic[21], Right = action_mimic[28]
+                                left_shoulder_pitch = action_mimic[23]   # left arm shoulder pitch (index 21+2)
+                                right_shoulder_pitch = action_mimic[30]  # right arm shoulder pitch (index 28+2)
+                                avg_shoulder_pitch = (left_shoulder_pitch + right_shoulder_pitch) / 2
+                                
+                                # Compensation: when arms are at side (pitch > -0.2), add forward lean
+                                # Scale: arms at side → add -0.08 rad (~4.5°) forward pitch
+                                # Scale: arms in front → no extra compensation needed
+                                PITCH_COMP_SCALE = 0.15  # How much to compensate (rad) when arms fully at side
+                                PITCH_THRESHOLD = -0.3   # Arms "in front" threshold
+                                
+                                if avg_shoulder_pitch > PITCH_THRESHOLD:
+                                    # Arms are at side or behind - add forward lean
+                                    # Linear interpolation: at PITCH_THRESHOLD → 0 comp, at 0 → full comp
+                                    arm_factor = (avg_shoulder_pitch - PITCH_THRESHOLD) / (0 - PITCH_THRESHOLD)
+                                    arm_factor = np.clip(arm_factor, 0, 1)
+                                    pitch_compensation = -PITCH_COMP_SCALE * arm_factor  # negative = lean forward
+                                else:
+                                    pitch_compensation = 0.0
+                                
+                                adjusted_pitch = waist_pitch + pitch_compensation
+                                torso_rpy = np.array([waist_roll, adjusted_pitch, waist_yaw], dtype=np.float32)
+                            
                             # GearWBC: takes quat directly, outputs 15 DOF (legs + waist)
                             loco_action, loco_kps, loco_kds = self.loco_policy.compute(
-                                dof_pos, dof_vel, ang_vel, quat, vel_cmd, torso_rpy=None
+                                dof_pos, dof_vel, ang_vel, quat, vel_cmd, torso_rpy=torso_rpy
                             )
+                            
+                            # Debug: print torso compensation info (first time only)
+                            if torso_rpy is not None and not hasattr(self, '_torso_comp_logged'):
+                                print(f"[GearWBC] Torso compensation ENABLED with ARM-POSITION-AWARE pitch adjustment")
+                                print(f"[GearWBC]   Base waist RPY: roll={waist_roll:.3f}, pitch={waist_pitch:.3f}, yaw={waist_yaw:.3f}")
+                                print(f"[GearWBC]   Arm pitch compensation: up to {PITCH_COMP_SCALE:.2f} rad ({np.degrees(PITCH_COMP_SCALE):.1f}°) forward lean when arms at side")
+                                self._torso_comp_logged = True
                             
                             # GearWBC target: legs + waist from policy, arms FROZEN
                             target_dof_pos[:15] = loco_action[:15]  # Legs + waist from GearWBC

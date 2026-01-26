@@ -202,13 +202,13 @@ class StateMachine:
         left_trig = left_ctrl.get('index_trig', False)
         right_grip = right_ctrl.get('grip', False)
         left_grip = left_ctrl.get('grip', False)
-        
+
         left_axis_click = left_ctrl.get('axis_click', False)
-        
+
         # ===== Emergency Stop (Left axis click) =====
         if left_axis_click and not self._left_axis_click_was_pressed:
             self._emergency_stop()
-        
+
         # ===== A Button Modifier Logic =====
         # On A press: start tracking
         if right_a and not self._prev_right_a:
@@ -235,15 +235,15 @@ class StateMachine:
         if not right_a and self._prev_right_a:
             if not self._right_a_used_as_modifier:
                 # Toggle between idle and teleop
-                if self.state == "idle":
-                    self.state = "teleop"
+            if self.state == "idle":
+                self.state = "teleop"
                     print("[STATE] idle → teleop")
-                elif self.state == "teleop":
+            elif self.state == "teleop":
                     self.state = "idle"
                     print("[STATE] teleop → idle")
             self._right_a_held = False
             self._right_a_used_as_modifier = False
-        
+
         # ===== X/Y Modifier for Finger/Thumb Control =====
         self._left_x_held = left_x
         self._left_y_held = left_y

@@ -14,15 +14,19 @@ import queue
 class InspireHandController:
     """Controller for a single Inspire Hand via Modbus TCP"""
     
-    # Register addresses (from WORKING_CONFIGURATION.md)
-    SET_ANGLE_REG = 1486  # Write angles
-    GET_ANGLE_REG = 1546  # Read angles
-    GET_POSITION_REG = 1534  # Read position
-    GET_FORCE_REG = 1582  # Read force
-    GET_CURRENT_REG = 1594  # Read current
-    GET_ERROR_REG = 1606  # Read errors
-    GET_TEMP_REG = 1618  # Read temperature
-    RESET_ERROR_REG = 1004  # Reset errors
+    # Register addresses (from RH56DFTP User Manual V1.0.0)
+    SET_ANGLE_REG = 1486      # Write angles (ANGLE_SET)
+    SET_FORCE_REG = 1498      # Write force threshold (FORCE_SET) - limits closing force
+    SET_SPEED_REG = 1522      # Write speed (SPEED_SET)
+    DEFAULT_FORCE_REG = 1044  # Power-on default force threshold (DEFAULT_FORCE_SET)
+    GET_POSITION_REG = 1534   # Read position (POS_ACT)
+    GET_ANGLE_REG = 1546      # Read angles (ANGLE_ACT)
+    GET_FORCE_REG = 1582      # Read force (FORCE_ACT)
+    GET_CURRENT_REG = 1594    # Read current (CURRENT)
+    GET_ERROR_REG = 1606      # Read errors (ERROR)
+    GET_STATUS_REG = 1612     # Read status (STATUS)
+    GET_TEMP_REG = 1618       # Read temperature (TEMP)
+    RESET_ERROR_REG = 1004    # Reset errors (CLEAR_ERROR)
     
     # Angle range (0=open, 2000=closed for fingers)
     ANGLE_MIN = 0
@@ -308,6 +312,70 @@ class InspireHandController:
             return np.array(angles)
         return None
     
+    def set_force_threshold(self, force_values):
+        """
+        Set force threshold for each DOF to limit closing force.
+        Lower values = weaker grip, less likely to get stuck.
+        
+        Args:
+            force_values: Array of 6 force thresholds (0-3000 range per manual)
+                         DOF order: [little, ring, middle, index, thumb_bend, thumb_rot]
+                         Lower = softer grip, Higher = stronger grip
+                         Example from manual: 300 = soft grip
+                         Recommended: 300-800 for normal use
+        """
+        if len(force_values) != self.NUM_DOFS:
+            print(f"[ERROR] Expected {self.NUM_DOFS} force values, got {len(force_values)}")
+            return False
+        
+        force_clamped = np.clip(force_values, 0, 3000).astype(np.int16)
+        return self._send_modbus_command(0x10, self.SET_FORCE_REG, force_clamped.tolist())
+    
+    def set_force_threshold_all(self, force_value):
+        """
+        Set same force threshold for all DOFs.
+        
+        Args:
+            force_value: Force threshold (0-3000 range)
+                        - 200-400: Very soft grip (safe testing)
+                        - 500-800: Medium grip (recommended)
+                        - 1000-1500: Strong grip
+                        - 3000: Maximum force (may cause stuck fingers)
+        """
+        force_values = [int(force_value)] * self.NUM_DOFS
+        return self.set_force_threshold(force_values)
+    
+    def read_force(self):
+        """Read actual force applied to each finger"""
+        response = self._send_modbus_command(0x03, self.GET_FORCE_REG, self.NUM_DOFS)
+        if response and len(response) >= 2 + self.NUM_DOFS * 2:
+            forces = []
+            for i in range(self.NUM_DOFS):
+                offset = 2 + i * 2
+                force = struct.unpack(">H", response[offset:offset+2])[0]
+                forces.append(force)
+            return np.array(forces)
+        return None
+    
+    def set_speed(self, speed_values):
+        """
+        Set speed for each DOF. Lower speed = gentler closing.
+        
+        Args:
+            speed_values: Array of 6 speed values (0-1000)
+        """
+        if len(speed_values) != self.NUM_DOFS:
+            print(f"[ERROR] Expected {self.NUM_DOFS} speed values, got {len(speed_values)}")
+            return False
+        
+        speed_clamped = np.clip(speed_values, 0, 1000).astype(np.int16)
+        return self._send_modbus_command(0x10, self.SET_SPEED_REG, speed_clamped.tolist())
+    
+    def set_speed_all(self, speed_value):
+        """Set same speed for all DOFs."""
+        speed_values = [int(speed_value)] * self.NUM_DOFS
+        return self.set_speed(speed_values)
+    
     def stop(self):
         """Stop async worker thread"""
         if self.async_mode and self.running:
@@ -370,13 +438,35 @@ class DualHandController:
         self.left_hand.close_hand()
         self.right_hand.close_hand()
     
+    def set_force_limit(self, force_value):
+        """
+        Set force threshold for both hands to prevent fingers getting stuck.
+        
+        Args:
+            force_value: Force threshold (0-3000 per Inspire manual)
+                        - 200-400: Very soft grip (safe for testing)
+                        - 500-800: Medium grip (recommended)
+                        - 1000-1500: Strong grip
+                        - 3000: Maximum force (may cause stuck fingers)
+                        
+        Note: Manual example uses 300 for index finger soft grip
+        """
+        print(f"[INSPIRE] Setting force limit to {force_value} on both hands")
+        self.left_hand.set_force_threshold_all(force_value)
+        self.right_hand.set_force_threshold_all(force_value)
+    
+    def set_speed(self, speed_value):
+        """
+        Set closing speed for both hands.
+        
+        Args:
+            speed_value: Speed (0-1000), lower = gentler closing
+        """
+        print(f"[INSPIRE] Setting speed to {speed_value} on both hands")
+        self.left_hand.set_speed_all(speed_value)
+        self.right_hand.set_speed_all(speed_value)
+    
     def stop(self):
         """Stop both hands"""
         self.left_hand.stop()
         self.right_hand.stop()
-
-
-
-
-
-
