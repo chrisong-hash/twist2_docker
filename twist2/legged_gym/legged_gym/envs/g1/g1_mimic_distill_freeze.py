@@ -28,6 +28,13 @@ class G1MimicDistillFreeze(G1MimicDistill):
         
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
         
+        # Register custom reward scales so parent's logging doesn't crash
+        # These are already scaled when added to rew_buf, so set scale to 1.0 for logging
+        self.reward_scales['freeze_stability'] = 1.0
+        self.reward_scales['standing_still'] = 1.0
+        self.reward_scales['default_pose_tracking'] = 1.0
+        self.reward_scales['action_jerk'] = 1.0
+        
     def _init_buffers(self):
         super()._init_buffers()
         self._init_freeze_buffers()
