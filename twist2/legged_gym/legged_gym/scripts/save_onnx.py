@@ -94,9 +94,10 @@ def convert_to_onnx(args):
     num_priop_observations = 92  # n_proprio from debug output
     
     # Future motion observations
-    num_future_steps = 1  # len(tar_motion_steps_future)
+    # V6.2 uses 3 future frames at 0.1s, 0.3s, 0.5s ahead
+    num_future_steps = 3  # len(tar_motion_steps_future) = [5, 15, 25] = 3 frames
     n_future_obs_single = 35  # 35 dims per frame
-    num_future_observations = num_future_steps * n_future_obs_single  # n_future_obs = 1 * 35 = 35
+    num_future_observations = num_future_steps * n_future_obs_single  # n_future_obs = 3 * 35 = 105
     
     # Single step observation size (for history)
     n_obs_single = 127  # n_mimic_obs + n_proprio = 35 + 92 = 127

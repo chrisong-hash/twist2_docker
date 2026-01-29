@@ -425,3 +425,4 @@ class G1MimicPrivCfgPPOV4(HumanoidMimicCfgPPO):
         layer_norm = True
         motion_latent_dim = 128
 
+

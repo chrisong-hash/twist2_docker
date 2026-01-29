@@ -42,3 +42,4 @@ python server_low_level_g1_real.py \
     --smooth_body 0.5
     # --record_proprio \
 
+

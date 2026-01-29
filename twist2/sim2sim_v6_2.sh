@@ -10,7 +10,8 @@
 SCRIPT_DIR=$(dirname $(realpath $0))
 
 # Default to V6.2 student policy (update this path after training)
-ckpt_path=${1:-${SCRIPT_DIR}/legged_gym/logs/h1/student_v6_2/model_latest.onnx}
+ckpt_path=${1:-${SCRIPT_DIR}/legged_gym/logs/h1/student_v6_2/model_6000.onnx}
+# ckpt_path=/home/robo/CodeSpace/twist2_docker/twist2/legged_gym/logs/h1/student_v6_2/model_6000.onnx
 
 echo "=============================================="
 echo "  Sim2Sim V6.2 (Real Future Observations)"
@@ -33,4 +34,5 @@ python server_low_level_g1_sim_v6_2.py \
     --device cuda \
     --redis_ip localhost \
     --robot unitree_g1_with_hands
+
 

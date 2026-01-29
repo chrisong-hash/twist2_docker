@@ -1,23 +1,28 @@
 """
-G1 Mimic Distill Config V7 - RANDOM MOTION FREEZE
+G1 Mimic Distill Config V7 - RANDOM MOTION FREEZE + ANTI-SPASM
 
-Concept: Humans can stop at any point in motion and remain stable.
-This config teaches the robot the same ability through random motion freezing.
+Key features:
+1. Random Motion Freeze - teaches stability at any pose
+2. Anti-spasm (jerk penalty) - prevents oscillation without killing responsiveness
+3. Standing still rewards - encourages holding position when target is stationary
+4. NO future observations for student - deployment-friendly approach
 
 During training:
 - ~1 freeze per episode, lasting 0.5-1.5 seconds
 - Robot is rewarded for maintaining the "shape" (±10% joint tolerance)
 - Robot gets bonus for being stable during freeze (low velocity)
+- Jerk penalty catches back-and-forth oscillation, not smooth fast movements
 
-Key insight: The freeze mechanism itself teaches "when to stop".
-We don't need action_rate penalty to force smoothness - 
-let the robot move freely during motion, freeze teaches stability.
+Key insight: The freeze mechanism teaches "when to stop".
+Jerk penalty teaches "how to move smoothly".
+Together they create responsive but stable motion.
 
 Benefits:
 - Learns to be stable at ANY pose, not just during transitions
 - Removes reliance on momentum-based motion
-- Should reduce stuttering (policy learns stopping is okay)
+- Prevents spasming/oscillation (from V6.2 learnings)
 - Responsive tracking during motion + stable during freeze
+- Student uses history only (no future obs) for reliable deployment
 """
 
 from legged_gym.envs.base.humanoid_mimic_config import HumanoidMimicCfg, HumanoidMimicCfgPPO
@@ -250,6 +255,17 @@ class G1MimicPrivCfgV7(HumanoidMimicCfg):
             
             # Note: freeze_stability reward is added separately in the environment
             # with scale = cfg.freeze.stability_bonus (1.0)
+            
+            # === STANDING STILL / DEFAULT POSE ===
+            # When reference motion has low velocity, reward staying still
+            standing_still = 2.0  # Reward low actual velocity when target is stationary
+            default_pose_tracking = 1.5  # Reward being at default joint angles when idle
+            
+            # === ANTI-SPASM (Jerk penalty) ===
+            # Penalizes rapid DIRECTION changes (oscillation) without penalizing fast smooth movements
+            # This is different from action_rate which penalizes ALL fast changes
+            # Jerk = change in acceleration = (a_t - 2*a_{t-1} + a_{t-2})
+            action_jerk = -0.5  # Penalize rapid direction changes (oscillation/spasming)
 
 
         min_dist = 0.1
@@ -343,7 +359,7 @@ class G1MimicPrivCfgPPOV7(HumanoidMimicCfgPPO):
         policy_class_name = 'ActorCriticMimic'
         algorithm_class_name = 'PPO'
         runner_class_name = 'OnPolicyRunnerMimic'
-        max_iterations = 1_000_002
+        max_iterations = 20_000  # Capped at 20k like V6
 
         save_interval = 500
         experiment_name = 'test'

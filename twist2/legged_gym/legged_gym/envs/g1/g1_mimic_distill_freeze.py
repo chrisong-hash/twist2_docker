@@ -31,6 +31,13 @@ class G1MimicDistillFreeze(G1MimicDistill):
     def _init_buffers(self):
         super()._init_buffers()
         self._init_freeze_buffers()
+        self._init_jerk_buffers()
+    
+    def _init_jerk_buffers(self):
+        """Initialize buffers for jerk (anti-spasm) computation."""
+        # Need to track last 2 actions to compute jerk
+        # last_actions is already tracked by parent, we add last_last_actions
+        self.last_last_actions = torch.zeros_like(self.actions)
         
     def _init_freeze_buffers(self):
         """Initialize buffers for motion freeze tracking."""
@@ -122,15 +129,21 @@ class G1MimicDistillFreeze(G1MimicDistill):
         self._freeze_ref_dof_pos[env_ids] = 0
     
     def reset_idx(self, env_ids):
-        """Override to also reset freeze state."""
+        """Override to also reset freeze state and jerk buffers."""
         super().reset_idx(env_ids)
         if len(env_ids) > 0:
             self._reset_freeze_state(env_ids)
+            # Reset jerk tracking buffers
+            self.last_last_actions[env_ids] = 0.
     
     def post_physics_step(self):
-        """Override to add freeze logic."""
+        """Override to add freeze logic and jerk tracking."""
         # Update freeze state (decrement counters, end freezes)
         self._update_freeze_state()
+        
+        # Update jerk tracking: shift action history BEFORE parent updates last_actions
+        # This ensures: last_last_actions = a_{t-2}, last_actions = a_{t-1}, actions = a_t
+        self.last_last_actions[:] = self.last_actions[:]
         
         # Call parent post_physics_step
         super().post_physics_step()
@@ -180,8 +193,77 @@ class G1MimicDistillFreeze(G1MimicDistill):
         reward = torch.where(self._freeze_active, combined_stability, torch.zeros_like(combined_stability))
         return reward
     
+    def _is_reference_stationary(self):
+        """Check if the reference motion is stationary (low target velocity)."""
+        # Check if reference root velocity is near zero
+        ref_root_vel_mag = torch.norm(self._ref_root_vel[:, :2], dim=-1)  # XY velocity
+        ref_dof_vel_mag = torch.norm(self._ref_dof_vel, dim=-1)
+        
+        # Threshold for "stationary" - tune as needed
+        vel_threshold = 0.1  # m/s for root, rad/s for joints
+        
+        is_stationary = (ref_root_vel_mag < vel_threshold) & (ref_dof_vel_mag < vel_threshold * 10)
+        return is_stationary
+    
+    def _reward_standing_still(self):
+        """Reward for staying still when reference motion is stationary."""
+        is_stationary = self._is_reference_stationary()
+        
+        if not is_stationary.any():
+            return torch.zeros(self.num_envs, device=self.device)
+        
+        # Reward low actual velocity when reference is stationary
+        actual_root_vel = torch.norm(self.base_lin_vel[:, :2], dim=-1)
+        actual_dof_vel = torch.norm(self.dof_vel, dim=-1)
+        
+        # Exponential reward for low velocity
+        root_still_reward = torch.exp(-5.0 * actual_root_vel)
+        dof_still_reward = torch.exp(-0.5 * actual_dof_vel)
+        
+        combined_reward = 0.6 * root_still_reward + 0.4 * dof_still_reward
+        
+        # Only apply when reference is stationary (and not during freeze, which has its own reward)
+        reward = torch.where(is_stationary & ~self._freeze_active, combined_reward, torch.zeros_like(combined_reward))
+        return reward
+    
+    def _reward_default_pose_tracking(self):
+        """Reward for being at default joint angles when idle/stationary."""
+        is_stationary = self._is_reference_stationary()
+        
+        if not is_stationary.any():
+            return torch.zeros(self.num_envs, device=self.device)
+        
+        # Calculate distance from default pose
+        dof_diff = torch.abs(self.dof_pos - self.default_dof_pos)
+        dof_error = torch.mean(dof_diff, dim=-1)
+        
+        # Exponential reward for being close to default
+        default_pose_reward = torch.exp(-2.0 * dof_error)
+        
+        # Only apply when reference is stationary
+        reward = torch.where(is_stationary & ~self._freeze_active, default_pose_reward, torch.zeros_like(default_pose_reward))
+        return reward
+    
+    def _reward_action_jerk(self):
+        """
+        Anti-spasm penalty: Penalizes rapid direction changes (oscillation) without 
+        penalizing smooth fast movements.
+        
+        Jerk = change in acceleration = (a_t - 2*a_{t-1} + a_{t-2})
+        
+        This is different from action_rate which penalizes ALL fast changes.
+        Jerk specifically catches back-and-forth oscillation patterns.
+        """
+        # Compute discrete jerk (second derivative of action)
+        # jerk = a_t - 2*a_{t-1} + a_{t-2}
+        action_jerk = self.actions - 2 * self.last_actions + self.last_last_actions
+        
+        # Return sum of squared jerk (negative reward = penalty)
+        jerk_penalty = torch.sum(action_jerk ** 2, dim=-1)
+        return jerk_penalty
+    
     def compute_reward(self):
-        """Override to add freeze stability reward."""
+        """Override to add freeze stability, standing still, and default pose rewards."""
         # Call parent reward computation
         super().compute_reward()
         
@@ -195,6 +277,36 @@ class G1MimicDistillFreeze(G1MimicDistill):
                 self.episode_sums['freeze_stability'] = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
             if hasattr(self, 'episode_sums'):
                 self.episode_sums['freeze_stability'] += freeze_stability_rew
+        
+        # Add standing still reward
+        if hasattr(self.cfg.rewards.scales, 'standing_still') and self.cfg.rewards.scales.standing_still > 0:
+            standing_still_rew = self._reward_standing_still() * self.cfg.rewards.scales.standing_still
+            self.rew_buf += standing_still_rew
+            
+            if hasattr(self, 'episode_sums'):
+                if 'standing_still' not in self.episode_sums:
+                    self.episode_sums['standing_still'] = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+                self.episode_sums['standing_still'] += standing_still_rew
+        
+        # Add default pose tracking reward
+        if hasattr(self.cfg.rewards.scales, 'default_pose_tracking') and self.cfg.rewards.scales.default_pose_tracking > 0:
+            default_pose_rew = self._reward_default_pose_tracking() * self.cfg.rewards.scales.default_pose_tracking
+            self.rew_buf += default_pose_rew
+            
+            if hasattr(self, 'episode_sums'):
+                if 'default_pose_tracking' not in self.episode_sums:
+                    self.episode_sums['default_pose_tracking'] = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+                self.episode_sums['default_pose_tracking'] += default_pose_rew
+        
+        # Add action jerk (anti-spasm) penalty
+        if hasattr(self.cfg.rewards.scales, 'action_jerk') and self.cfg.rewards.scales.action_jerk != 0:
+            action_jerk_rew = self._reward_action_jerk() * self.cfg.rewards.scales.action_jerk
+            self.rew_buf += action_jerk_rew
+            
+            if hasattr(self, 'episode_sums'):
+                if 'action_jerk' not in self.episode_sums:
+                    self.episode_sums['action_jerk'] = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+                self.episode_sums['action_jerk'] += action_jerk_rew
     
     def get_freeze_stats(self):
         """Return freeze statistics for logging."""
@@ -204,4 +316,5 @@ class G1MimicDistillFreeze(G1MimicDistill):
             'freeze_success_rate': self._freeze_success_count / max(1, self._total_freeze_count),
             'currently_frozen': self._freeze_active.sum().item(),
         }
+
 

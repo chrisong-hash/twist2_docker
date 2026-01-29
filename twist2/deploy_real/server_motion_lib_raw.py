@@ -160,7 +160,7 @@ def main(args, xml_file, robot_base):
     future_steps = FUTURE_STEPS_V6_2
     
     print(f"[Motion Server V6.2] Configuration:")
-    print(f"  Motion length: {motion_length:.2f}s ({num_steps} steps)")
+    print(f"  Motion length: {motion_length.item():.2f}s ({num_steps} steps)")
     print(f"  Control dt: {control_dt:.3f}s (50Hz)")
     print(f"  Future steps: {future_steps} = [{', '.join([f'{s*control_dt:.2f}s' for s in future_steps])}]")
     print(f"  Future obs dims: {len(future_steps) * 35} = {len(future_steps)} frames × 35 dims")
@@ -208,7 +208,7 @@ def main(args, xml_file, robot_base):
                 elif not motion_started:
                     # Send default pose while waiting
                     idle_obs = start_frame_mimic_obs if args.send_start_frame_as_end_frame else DEFAULT_MIMIC_OBS[args.robot]
-                    redis_client.set(f"action_body_{args.robot}", json.dumps(idle_obs.tolist()))
+                    redis_client.set(f"motion_raw_{args.robot}", json.dumps(idle_obs.tolist()))
                     redis_client.set(f"action_hand_left_{args.robot}", json.dumps(np.zeros(7).tolist()))
                     redis_client.set(f"action_hand_right_{args.robot}", json.dumps(np.zeros(7).tolist()))
                     # Also send empty future obs
@@ -242,8 +242,8 @@ def main(args, xml_file, robot_base):
             mimic_obs_list = mimic_obs.tolist()
             future_obs_list = future_obs.tolist()
             
-            redis_client.set(f"action_body_{args.robot}", json.dumps(mimic_obs_list))
-            redis_client.set(f"action_mimic_future_{args.robot}", json.dumps(future_obs_list))  # NEW!
+            # Publish RAW motion data (for buffered server to process)
+            redis_client.set(f"motion_raw_{args.robot}", json.dumps(mimic_obs_list))
             redis_client.set(f"action_hand_left_{args.robot}", json.dumps(np.zeros(7).tolist()))
             redis_client.set(f"action_hand_right_{args.robot}", json.dumps(np.zeros(7).tolist()))
             redis_client.set(f"action_neck_{args.robot}", json.dumps(np.zeros(2).tolist()))
@@ -288,13 +288,13 @@ def main(args, xml_file, robot_base):
         for i in range(int(time_back_to_default / control_dt)):
             alpha = i / (time_back_to_default / control_dt)
             interp_obs = last_mimic_obs + (target_obs - last_mimic_obs) * alpha
-            redis_client.set(f"action_body_{args.robot}", json.dumps(interp_obs.tolist()))
+            redis_client.set(f"motion_raw_{args.robot}", json.dumps(interp_obs.tolist()))
             # Also interpolate future obs to target (all same)
             future_target = np.tile(target_obs, len(future_steps))
             redis_client.set(f"action_mimic_future_{args.robot}", json.dumps(future_target.tolist()))
             time.sleep(control_dt)
         
-        redis_client.set(f"action_body_{args.robot}", json.dumps(target_obs.tolist()))
+        redis_client.set(f"motion_raw_{args.robot}", json.dumps(target_obs.tolist()))
         if args.vis:
             viewer.close()
         print("[Motion Server V6.2] Done.")

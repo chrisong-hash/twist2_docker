@@ -114,19 +114,40 @@ class SimControllerV6_2:
         print(f"  total_obs_size: {self.total_obs_size}")
         
         # Initialize history buffer
+        # NOTE: Will be filled with first real observation on first step
+        # Training fills history with copies of current obs on reset, not zeros
         self.proprio_history_buf = deque(maxlen=self.history_len)
-        for _ in range(self.history_len):
-            self.proprio_history_buf.append(np.zeros(self.n_obs_single, dtype=np.float32))
+        self._history_initialized = False
         
         self.last_action = np.zeros(self.num_actions, dtype=np.float32)
         
-        # Control parameters
-        self.control_dt = 0.02  # 50Hz
-        self.action_scale = 0.25
+        # Control parameters - MATCH TRAINING: decimation=10, sim_dt=0.002 -> 50Hz policy
+        # MuJoCo XML has timestep=0.001, so we step 2x per "training step" to match 0.002
+        self.sim_dt = 0.001           # MuJoCo timestep
+        self.train_sim_dt = 0.002     # Training sim.dt
+        self.train_decimation = 10    # Training decimation
+        self.control_dt = self.train_decimation * self.train_sim_dt  # 0.02s = 50Hz
+        self.sim_decimation = int(self.control_dt / self.sim_dt)     # 20 MuJoCo steps
+        self.action_scale = 0.5  # Match training config
         
-        # PD gains
-        self.kps = np.array([100]*6 + [100]*6 + [200]*3 + [40]*7 + [40]*7, dtype=np.float32)
-        self.kds = np.array([2]*6 + [2]*6 + [5]*3 + [2]*7 + [2]*7, dtype=np.float32)
+        print(f"  control_dt: {self.control_dt}s ({1/self.control_dt:.0f}Hz)")
+        print(f"  sim_decimation: {self.sim_decimation} steps @ {self.sim_dt}s")
+        
+        # PD gains - MATCH TRAINING CONFIG v6.py
+        # Left leg: hip_yaw(100), hip_roll(100), hip_pitch(100), knee(150), ankle(40), ankle(40)
+        # Right leg: same
+        # Waist: 3x 150
+        # Arms: 7x 40 each
+        self.kps = np.array([100, 100, 100, 150, 40, 40,    # Left leg
+                            100, 100, 100, 150, 40, 40,     # Right leg  
+                            150, 150, 150,                   # Waist
+                            40, 40, 40, 40, 40, 40, 40,     # Left arm
+                            40, 40, 40, 40, 40, 40, 40], dtype=np.float32)
+        self.kds = np.array([2, 2, 2, 4, 2, 2,              # Left leg
+                            2, 2, 2, 4, 2, 2,               # Right leg
+                            4, 4, 4,                         # Waist
+                            5, 5, 5, 5, 5, 5, 5,            # Left arm
+                            5, 5, 5, 5, 5, 5, 5], dtype=np.float32)
         
         self.record_video = record_video
         self.record_proprio = record_proprio
@@ -163,6 +184,7 @@ class SimControllerV6_2:
         
         step_count = 0
         policy_step_count = 0
+        loop_start_time = time.time()
         
         try:
             while viewer.is_running():
@@ -183,8 +205,8 @@ class SimControllerV6_2:
                 obs_body_dof_vel[self.ankle_idx] = 0.0  # Zero ankle velocity
                 
                 obs_proprio = np.concatenate([
-                    ang_vel * 0.25,                      # 3 dims
-                    rpy[:2],                              # 2 dims (roll, pitch)
+                    ang_vel * 0.25,                      # 3 dims (obs_scales.ang_vel)
+                    rpy[:2],                              # 2 dims (roll, pitch) - NOT scaled in training!
                     (dof_pos - self.default_dof_pos),    # 29 dims
                     obs_body_dof_vel * 0.05,             # 29 dims
                     self.last_action                      # 29 dims
@@ -210,18 +232,26 @@ class SimControllerV6_2:
                     if len(future_obs) != self.n_future_obs:
                         print(f"[V6.2] WARNING: Expected {self.n_future_obs} future dims, got {len(future_obs)}")
                         future_obs = np.zeros(self.n_future_obs, dtype=np.float32)
+                    future_source = "REAL"
                 else:
                     # Fallback: use current frame repeated (like old behavior)
                     future_obs = np.tile(action_mimic, 3)[:self.n_future_obs]
+                    future_source = "TILED"
                 
                 # Build full observation
                 obs_full = np.concatenate([action_mimic, obs_proprio])  # 127 dims
                 
-                # Update history
-                obs_hist = np.array(self.proprio_history_buf).flatten()  # 15 × 127 = 1905 dims
+                # Initialize history with copies of first observation (like training does on reset)
+                if not self._history_initialized:
+                    for _ in range(self.history_len):
+                        self.proprio_history_buf.append(obs_full.copy())
+                    self._history_initialized = True
+                
+                # Get history BEFORE updating (matches training order)
+                obs_hist = np.array(self.proprio_history_buf).flatten()  # 10 × 127 = 1270 dims
                 self.proprio_history_buf.append(obs_full)
                 
-                # Combine: current (127) + history (1905) + future (105) = 2137
+                # Combine: current (127) + history (1270) + future (105) = 1502
                 obs_buf = np.concatenate([obs_full, obs_hist, future_obs])
                 
                 # Verify size
@@ -229,26 +259,39 @@ class SimControllerV6_2:
                     print(f"[V6.2] ERROR: Expected {self.total_obs_size} obs, got {obs_buf.shape[0]}")
                     continue
                 
-                # Run policy
-                obs_tensor = torch.from_numpy(obs_buf).float().unsqueeze(0)
+                # Run policy (with clipping like original sim2sim)
+                obs_tensor = torch.from_numpy(obs_buf).float().unsqueeze(0).clip(-100, 100)
                 if 'cuda' in self.device:
                     obs_tensor = obs_tensor.to(self.device)
                 
                 with torch.no_grad():
                     raw_action = self.policy(obs_tensor).cpu().numpy().squeeze()
+                raw_action = np.clip(raw_action, -100, 100)  # Clip action outputs
                 
-                # Convert to target positions
+                # DEBUG: Print action and observation statistics every 100 steps
+                if policy_step_count % 100 == 0:
+                    print(f"[DEBUG] obs_full: min={obs_full.min():.3f}, max={obs_full.max():.3f}, std={obs_full.std():.3f}")
+                    print(f"[DEBUG] raw_action: min={raw_action.min():.3f}, max={raw_action.max():.3f}, "
+                          f"hip=[{raw_action[0]:.3f},{raw_action[6]:.3f}], knee=[{raw_action[3]:.3f},{raw_action[9]:.3f}]")
+                
+                # Convert action to target positions
                 target_dof_pos = raw_action * self.action_scale + self.default_dof_pos
-                self.last_action = raw_action.copy()
+                self.last_action = raw_action.copy()  # Store for observation
                 
-                # PD control
-                torque = self.kps * (target_dof_pos - dof_pos) - self.kds * dof_vel
-                self.data.ctrl[:self.num_actions] = torque
+                # PD control - step simulation multiple times with same target (batch physics)
+                for sim_step in range(self.sim_decimation):
+                    # Get current state for PD
+                    current_dof_pos = self.data.qpos[7:7+self.num_actions].copy()
+                    current_dof_vel = self.data.qvel[6:6+self.num_actions].copy()
+                    
+                    # PD control
+                    torque = self.kps * (target_dof_pos - current_dof_pos) - self.kds * current_dof_vel
+                    self.data.ctrl[:self.num_actions] = torque
+                    
+                    # Step simulation
+                    mujoco.mj_step(self.model, self.data)
                 
-                # Step simulation
-                mujoco.mj_step(self.model, self.data)
-                
-                # Update viewer
+                # Sync viewer once after all physics steps
                 viewer.sync()
                 
                 step_count += 1
@@ -256,12 +299,17 @@ class SimControllerV6_2:
                 
                 # Print progress
                 if policy_step_count % 100 == 0:
-                    print(f"[V6.2] Step {policy_step_count} | future_obs: [{future_obs[0]:.2f}, ..., {future_obs[-1]:.2f}]")
+                    cur_dof = self.data.qpos[7:7+self.num_actions]
+                    elapsed_total = time.time() - loop_start_time
+                    actual_fps = policy_step_count / elapsed_total if elapsed_total > 0 else 0
+                    print(f"[V6.2] Step {policy_step_count} | FPS: {actual_fps:.1f} | future: {future_source}")
+                    print(f"  L_hip: tgt={target_dof_pos[0]:.3f} act={cur_dof[0]:.3f} | R_hip: tgt={target_dof_pos[6]:.3f} act={cur_dof[6]:.3f}")
                 
-                # Maintain real-time pace
+                # Real-time pacing
+                target_dt = self.control_dt
                 elapsed = time.time() - t0
-                if elapsed < self.control_dt:
-                    time.sleep(self.control_dt - elapsed)
+                if elapsed < target_dt:
+                    time.sleep(target_dt - elapsed)
         
         except KeyboardInterrupt:
             print("\n[V6.2] Interrupted by user")
