@@ -1,8 +1,31 @@
+"""
+G1 Mimic Distill Config V4 - Balanced Penalty Distribution
+
+Based on WandB reward breakdown analysis of V2 vs V3:
+- V3's action_rate penalty was DOMINATING (54% of all penalties = -0.673)
+- V2 had better tracking rewards (7.34 vs V3's 6.19)
+- V3's orientation penalty was tiny (-0.016) meaning robot stays upright
+
+V4 Strategy:
+- REDUCE action_rate back to middle ground (-0.1 instead of V3's -0.5)
+- KEEP orientation penalty (it's working, not dominating)  
+- SLIGHTLY BOOST tracking rewards to match V2
+- KEEP ang_vel_xy moderate (reduce from V3's -0.25 to -0.15)
+
+Target penalty distribution:
+  action_rate: ~15% (was 54% in V3, 10% in V2)
+  ang_vel_xy: ~15% (was 21% in V3)
+  orientation: ~10%
+  dof_pos_limits: ~20%
+  dof_torque_limits: ~20%
+  others: ~20%
+"""
+
 from legged_gym.envs.base.humanoid_mimic_config import HumanoidMimicCfg, HumanoidMimicCfgPPO
 from legged_gym import LEGGED_GYM_ROOT_DIR
 
 
-class G1MimicPrivCfg(HumanoidMimicCfg):
+class G1MimicPrivCfgV4(HumanoidMimicCfg):
     class env(HumanoidMimicCfg.env):
         tar_motion_steps_priv = [1, 5, 10, 15, 20, 25, 30, 35, 40, 45,
                          50, 55, 60, 65, 70, 75, 80, 85, 90, 95,]
@@ -54,11 +77,11 @@ class G1MimicPrivCfg(HumanoidMimicCfg):
      
      
         dof_err_w = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, # Left Leg
-                     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, # Right Leg
-                     1.0, 1.0, 1.0, # waist yaw, roll, pitch
-                     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, # Left Arm
-                     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, # Right Arm
-                     ]
+                    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, # Right Leg
+                    1.0, 1.0, 1.0, # waist yaw, roll, pitch
+                    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, # Left Arm
+                    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, # Right Arm
+                    ]
         
         
         global_obs = False
@@ -205,55 +228,78 @@ class G1MimicPrivCfg(HumanoidMimicCfg):
         regularization_scale_curriculum = False
         regularization_scale_gamma = 0.0001
         
-        class scales:      
-            # v2: Prioritize root stability over joint tracking
-            # - Reduced joint tracking dominance (2.0 → 1.0)
-            # - Boosted root tracking (1.0 → 2.0)
-            # - Reduced survival reward (0.5 → 0.2)
-            # - Increased wobble penalty (-0.01 → -0.05)
-            tracking_joint_dof = 1.0  # was 2.0 - reduce dominance
+        class scales:
+            # ================================================================
+            # V4: BALANCED PENALTY DISTRIBUTION
+            # ================================================================
+            # Based on WandB analysis:
+            #   - V3's action_rate dominated at 54% of penalties (-0.673)
+            #   - V2 had better tracking (7.34 vs 6.19)
+            #   - orientation penalty is working (stays small = robot upright)
+            #
+            # V4 fixes:
+            #   - action_rate: -0.5 → -0.1 (reduce from 54% to ~15%)
+            #   - ang_vel_xy: -0.25 → -0.15 (reduce from 21% to ~15%)
+            #   - Keep orientation (working well)
+            #   - Boost tracking slightly toward V2 levels
+            # ================================================================
+            
+            # === TRACKING REWARDS (boost toward V2 levels) ===
+            tracking_joint_dof = 1.5   # V2=0.78, V3=0.64, bump up
             tracking_joint_vel = 0.2
-            # tracking_root_translation_xy = 1.0
             tracking_root_translation_z = 1.0
-            tracking_root_rotation = 2.0  # was 1.0 - boost root orientation
-            tracking_root_linear_vel = 2.0  # was 1.0 - boost velocity tracking
-            tracking_root_angular_vel = 2.0  # was 1.0 - boost angular vel tracking
-            tracking_keybody_pos = 2.0
-            tracking_keybody_pos_global = 3.0  # was 2.0 - boost global tracking
-            alive = 0.2  # was 0.5 - reduce survival reward
-            feet_slip = -0.1
-            feet_contact_forces = -5e-4      
+            tracking_root_rotation = 2.0      # good in V2/V3
+            tracking_root_linear_vel = 2.5    # V2=1.71, V3=1.33, boost
+            tracking_root_angular_vel = 2.0   # good
+            tracking_keybody_pos = 2.5        # V2=1.41, V3=1.12, boost
+            tracking_keybody_pos_global = 3.0 # good
+            
+            # === SURVIVAL ===
+            alive = 0.25  # between V2 (0.19) and V3 (0.22)
+            
+            # === GAIT REWARDS ===
+            feet_air_time = 5.0
+            
+            # ================================================================
+            # === V4 REBALANCED PENALTIES ===
+            # ================================================================
+            
+            # Orientation penalty - KEEP (working, robot stays upright)
+            orientation = -2.0
+            
+            # Joint limit penalty - moderate
+            dof_pos_limits = -2.5  # between V2's effective -0.064 and V3's -2.0
+            
+            # ACTION RATE - REDUCED (was dominating V3 at 54%!)
+            # V2 had -0.01 (actual: -0.07), V3 had -0.5 (actual: -0.67)
+            # Target: ~15% of penalty budget
+            action_rate = -0.1  # 5x less than V3, 10x more than default
+            
+            # ANGULAR VELOCITY - REDUCED slightly
+            # V2 had -0.05 (actual: -0.06), V3 had -0.25 (actual: -0.26)
+            # Target: ~15% of penalty budget  
+            ang_vel_xy = -0.15  # between V2 and V3
+            
+            # Other penalties - keep similar
             feet_stumble = -1.25
-            dof_pos_limits = -5.0
             dof_torque_limits = -1.0
+            feet_slip = -0.1
+            feet_contact_forces = -5e-4
             dof_vel = -1e-4
             dof_acc = -5e-8
-            action_rate = -0.01
-            feet_air_time = 5.0
-            ang_vel_xy = -0.05  # was -0.01 - penalize wobble more
             ankle_dof_acc = -5e-8 * 2
             ankle_dof_vel = -1e-4 * 2
             
-            
-            # TWIST version
-            # tracking_joint_dof = 0.6
-            # tracking_joint_vel = 0.2
-            # tracking_root_pose = 0.6
-            # tracking_root_vel = 1.0
-            # tracking_keybody_pos = 2.0
-            # feet_slip = -0.1
-            # feet_contact_forces = -5e-4      
-            # feet_stumble = -1.25
-            # dof_pos_limits = -5.0
-            # dof_torque_limits = -1.0
-            # dof_vel = -1e-4
-            # dof_acc = -5e-8
-            # action_rate = -0.01
-            # feet_air_time = 5.0
-            # ang_vel_xy = -0.01            
-            # ankle_dof_acc = -5e-8 * 2
-            # ankle_dof_vel = -1e-4 * 2
-            
+            # ================================================================
+            # Expected penalty distribution:
+            #   action_rate: ~15% (down from V3's 54%)
+            #   ang_vel_xy: ~15% (down from V3's 21%)
+            #   orientation: ~10-15%
+            #   dof_pos_limits: ~15-20%
+            #   dof_torque_limits: ~15%
+            #   others: ~20%
+            # ================================================================
+
 
         min_dist = 0.1
         max_dist = 0.4
@@ -267,7 +313,7 @@ class G1MimicPrivCfg(HumanoidMimicCfg):
         soft_torque_limit = 0.95
         torque_safety_limit = 0.9
         
-        # =========================
+        # Keep termination lenient for teleop
         termination_roll = 4.0
         termination_pitch = 4.0
         root_height_diff_threshold = 0.3
@@ -337,35 +383,12 @@ class G1MimicPrivCfg(HumanoidMimicCfg):
         motion_smooth = True
         motion_decompose = False
 
-        # motion_file = f"{LEGGED_GYM_ROOT_DIR}/motion_data_configs/example_motions.yaml"  # Original 10 clips
-        motion_file = f"{LEGGED_GYM_ROOT_DIR}/motion_data_configs/walking_focused.yaml"  # Pruned 2124 clips with backward walking
-        
-
-
-class G1MimicStuCfg(G1MimicPrivCfg):
-    class env(G1MimicPrivCfg.env):
-        obs_type = 'student'
-        tar_motion_steps = [1]
-        n_mimic_obs_single = G1MimicPrivCfg.env.n_mimic_obs_single
-        n_mimic_obs = len(tar_motion_steps) * n_mimic_obs_single
-        n_proprio = G1MimicPrivCfg.env.n_proprio
-        n_obs_single = n_mimic_obs + n_proprio
-        num_observations = n_obs_single * (G1MimicPrivCfg.env.history_len + 1)
-
-
-class G1MimicStuRLCfg(G1MimicPrivCfg):
-    class env(G1MimicPrivCfg.env):
-        obs_type = 'student'
-        tar_motion_steps = [1]
-        n_mimic_obs_single = G1MimicPrivCfg.env.n_mimic_obs_single
-        n_mimic_obs = len(tar_motion_steps) * n_mimic_obs_single
-        n_proprio = G1MimicPrivCfg.env.n_proprio
-        n_obs_single = n_mimic_obs + n_proprio
-        num_observations = n_obs_single * (G1MimicPrivCfg.env.history_len + 1)
+        # Use the pruned walking-focused dataset
+        motion_file = f"{LEGGED_GYM_ROOT_DIR}/motion_data_configs/walking_focused.yaml"
 
 
 
-class G1MimicPrivCfgPPO(HumanoidMimicCfgPPO):
+class G1MimicPrivCfgPPOV4(HumanoidMimicCfgPPO):
     seed = 1
     class runner(HumanoidMimicCfgPPO.runner):
         policy_class_name = 'ActorCriticMimic'
@@ -386,7 +409,7 @@ class G1MimicPrivCfgPPO(HumanoidMimicCfgPPO):
     class algorithm(HumanoidMimicCfgPPO.algorithm):
         grad_penalty_coef_schedule = [0.00, 0.00, 700, 1000]
         std_schedule = [1.0, 0.4, 4000, 1500]
-        entropy_coef = 0.005
+        entropy_coef = 0.005  # Keep default entropy
         
         # Transformer params
         # learning_rate = 1e-4 #1.e-3 #5.e-4
@@ -401,102 +424,4 @@ class G1MimicPrivCfgPPO(HumanoidMimicCfgPPO):
         activation = 'silu'
         layer_norm = True
         motion_latent_dim = 128
-        
-        
-class G1MimicStuCfgDAgger(G1MimicPrivCfgPPO):
-    seed = 1
-    
-    class teachercfg(G1MimicPrivCfgPPO):
-        pass
-    
-    class runner(G1MimicPrivCfgPPO.runner):
-        policy_class_name = 'DAggerActor'
-        algorithm_class_name = 'DAgger'
-        runner_class_name = 'DAggerRunner'
-        max_iterations = 1_000_002
-        warm_iters = 100
-        
-        # logging
-        save_interval = 500
-        experiment_name = 'test'
-        run_name = ''
-        resume = False
-        load_run = -1
-        checkpoint = -1
-        resume_path = None
-        
-        teacher_experiment_name = 'test'
-        teacher_proj_name = 'g1_priv_mimic'
-        teacher_checkpoint = -1
-        eval_student = False
 
-    class algorithm:
-        num_learning_epochs = 5
-        num_mini_batches = 4
-        learning_rate = 1e-4 #1.e-3 #5.e-4
-        max_grad_norm = 1.0
-        normalizer_update_iterations = 1000
-
-    class policy:
-        actor_hidden_dims = [1024, 1024, 512, 256] # best now
-        
-        # actor_hidden_dims = [512, 512, 256, 128] # worse than above
-        
-        history_latent_dim = 128
-        activation = 'silu' # can be elu, relu, selu, crelu, lrelu, tanh, sigmoid
-        
-
-class G1MimicStuRLCfgDAgger(G1MimicStuRLCfg):
-    seed = 1
-    
-    class teachercfg(G1MimicPrivCfgPPO):
-        pass
-    
-    class runner(G1MimicPrivCfgPPO.runner):
-        policy_class_name = 'ActorCriticTeleop'
-        algorithm_class_name = 'DaggerPPO'
-        runner_class_name = 'OnPolicyDaggerRunner'
-        max_iterations = 1_000_002
-        warm_iters = 100
-        
-        # logging
-        save_interval = 500
-        experiment_name = 'test'
-        run_name = ''
-        resume = False
-        load_run = -1
-        checkpoint = -1
-        resume_path = None
-        
-        teacher_experiment_name = 'test'
-        teacher_proj_name = 'g1_priv_mimic'
-        teacher_checkpoint = -1
-        eval_student = False
-
-    class algorithm(HumanoidMimicCfgPPO.algorithm):
-        grad_penalty_coef_schedule = [0.00, 0.00, 700, 1000]
-        std_schedule = [1.0, 0.4, 4000, 1500]
-        entropy_coef = 0.005
-        
-        dagger_coef_anneal_steps = 60000  # Total steps to anneal dagger_coef to dagger_coef_min
-        
-        # dagger_coef = 0.1
-        # dagger_coef_min = 0.01  # Minimum value for dagger_coef
-        dagger_coef = 0.2
-        dagger_coef_min = 0.1
-        # dagger_coef = 0.0
-        # dagger_coef_min = 0.0  # Minimum value for dagger_coef
-
-    class policy(HumanoidMimicCfgPPO.policy):
-        action_std = [0.7] * 12 + [0.4] * 3 + [0.5] * 14
-        init_noise_std = 1.0
-        obs_context_len = 11
-        actor_hidden_dims = [512, 512, 256, 128]
-        critic_hidden_dims = [512, 512, 256, 128]
-        activation = 'silu'
-        layer_norm = True
-        motion_latent_dim = 128
-        
-
-
-   

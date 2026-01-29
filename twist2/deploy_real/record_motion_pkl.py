@@ -35,7 +35,7 @@ from rich import print
 class MotionRecorder:
     """Records motion frames and saves to pkl format for training."""
     
-    def __init__(self, model, data, output_dir, prefix="sk_walk", fps=30):
+    def __init__(self, model, data, output_dir, prefix="c_walk", fps=30):
         self.model = model
         self.data = data
         self.output_dir = output_dir
@@ -187,7 +187,7 @@ class MotionRecorder:
 def main():
     parser = argparse.ArgumentParser(description='Record motion to pkl for training')
     parser.add_argument('--robot', default='unitree_g1', choices=['unitree_g1'])
-    parser.add_argument('--output_dir', default='../assets/TWIST2_full/eastworlds',
+    parser.add_argument('--output_dir', default='../../virtuals_dataset',
                        help='Output directory for pkl files')
     parser.add_argument('--prefix', default='sk_walk',
                        help='Prefix for output files (e.g., sk_walk -> sk_walk_001.pkl)')

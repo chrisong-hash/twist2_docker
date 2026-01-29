@@ -1,0 +1,8 @@
+# Single motion file - matches what run_motion_server.sh uses
+# Change the 'file' path to test different motions
+root_path: /home/robo/CodeSpace/twist2_docker/twist2/assets/example_motions
+motions:
+- file: 0807_yanjie_walk_001.pkl
+  weight: 1.0
+  description: yanjie walk motion 001
+

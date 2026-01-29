@@ -7,15 +7,15 @@
 
 cd deploy_real
 
-# Default prefix is sk_walk, can be overridden by first argument
-PREFIX=${1:-sk_walk}
+# Default prefix is c_walk, can be overridden by first argument
+PREFIX=${1:-c_walk}
 
 # Human height (adjust based on the operator)
 HUMAN_HEIGHT=1.8
 
 python record_motion_pkl.py \
     --robot unitree_g1 \
-    --output_dir ../assets/TWIST2_full/eastworlds \
+    --output_dir /workspace/data/virtuals_dataset/c_walk \
     --prefix $PREFIX \
     --actual_human_height $HUMAN_HEIGHT \
     --target_fps 30

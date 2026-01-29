@@ -4,7 +4,8 @@
 # Redis for motion streaming
 redis>=6.0.0
 
-# ONNX Runtime for inference
+# ONNX for model export and inference
+onnx>=1.14.0
 onnxruntime-gpu>=1.19.0
 
 # MuJoCo physics engine
@@ -24,6 +25,7 @@ pyfqmr
 # Utilities
 tqdm
 numpy==1.23.5
+loop-rate-limiters
 
 # Computer Vision
 opencv-python>=4.5.0

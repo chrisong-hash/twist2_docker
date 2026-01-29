@@ -1,0 +1,23 @@
+# Overfit test - tiny dataset to find reward ceilings
+# Use 3-5 simple forward walking clips only
+# Goal: See which rewards CAN be maximized vs which have fundamental issues
+
+root_path: /workspace/data/TWIST2_full
+
+motions:
+# Pick 3 simple, clean forward walking clips
+- file: twist1_to_twist2/accad_B1___stand_to_walk.pkl
+  weight: 1.0
+  description: stand to walk transition
+
+- file: twist1_to_twist2/accad_B10___walk_turn_left__45_.pkl
+  weight: 1.0
+  description: walk with 45 degree turn
+
+- file: twist1_to_twist2/accad_B20___walk_with_box.pkl
+  weight: 1.0
+  description: walk with upper body motion
+
+# Total: 3 clips (~30 seconds of motion)
+# Should be easy to overfit with default weights
+

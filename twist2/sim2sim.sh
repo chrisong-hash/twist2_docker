@@ -1,5 +1,7 @@
 SCRIPT_DIR=$(dirname $(realpath $0))
-ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_1017_20k.onnx
+# ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_1017_20k.onnx
+ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_v6_student.onnx
+# ckpt_path=${SCRIPT_DIR}/legged_gym/logs/h1/student_from_v6/model_17500.onnx
 
 cd deploy_real
 

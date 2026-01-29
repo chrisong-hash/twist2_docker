@@ -85,9 +85,13 @@ class HumanoidMimic(HumanoidChar):
         
     def _init_buffers(self):
         self._load_motions()
-        # if self.viewer is None:
-        self.max_episode_length_s = self._get_max_motion_len().item()
+        # Use minimum of config episode_length_s and max motion length
+        # This ensures episodes don't exceed config, but also don't exceed motion data
+        max_motion_len = self._get_max_motion_len().item()
+        config_episode_len = self.cfg.env.episode_length_s
+        self.max_episode_length_s = min(config_episode_len, max_motion_len)
         self.max_episode_length = np.ceil(self.max_episode_length_s / self.dt)
+        print(f"[Episode Length] Config: {config_episode_len}s, Max motion: {max_motion_len:.1f}s → Using: {self.max_episode_length_s:.1f}s ({int(self.max_episode_length)} steps)")
         super()._init_buffers()
         self._init_motion_buffers()
         
