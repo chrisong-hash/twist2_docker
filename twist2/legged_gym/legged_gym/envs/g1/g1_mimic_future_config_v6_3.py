@@ -54,11 +54,32 @@ class G1MimicStuFutureCfgPPOV6_3(G1MimicStuFutureCfgPPOV6_2):
     seed = 1
     
     class runner(G1MimicStuFutureCfgPPOV6_2.runner):
-        # Same as V6.2 but different experiment name
-        experiment_name = 'student_v6_3'
+        # Policy/algorithm selection for DAgger+PPO (inherited from V6.2)
+        policy_class_name = 'ActorCriticFuture'
+        algorithm_class_name = 'DaggerPPO'
+        runner_class_name = 'OnPolicyDaggerRunner'
         
-        # Training iterations - same as V6.2
+        # Training iterations
+        num_steps_per_env = 24
         max_iterations = 30_000
+        warm_iters = 200
+        
+        # Logging - V6.3 specific
+        save_interval = 500
+        experiment_name = 'student_v6_3'
+        run_name = ''
+        
+        # Load/resume
+        resume = False
+        load_run = -1
+        checkpoint = -1
+        resume_path = None
+        
+        # Teacher reference (V6) - MUST match actual path: logs/h1/responsive_v6/
+        teacher_experiment_name = 'responsive_v6'
+        teacher_proj_name = 'h1'
+        teacher_checkpoint = 20000
+        eval_student = False
         
     class algorithm(G1MimicStuFutureCfgPPOV6_2.algorithm):
         # Inherit V6.2 algorithm settings
