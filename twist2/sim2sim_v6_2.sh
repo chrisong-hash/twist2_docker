@@ -36,3 +36,4 @@ python server_low_level_g1_sim_v6_2.py \
     --robot unitree_g1_with_hands
 
 
+

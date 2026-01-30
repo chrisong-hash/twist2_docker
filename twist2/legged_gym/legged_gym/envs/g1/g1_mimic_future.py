@@ -18,6 +18,8 @@ class G1MimicFuture(G1MimicDistill):
     all original RL+BC functionality.
     
     Curriculum Masked Privilege Information (CMP)
+    
+    V6.3+: Added action jerk penalty to reduce oscillation/spasming behavior.
     """
     
     def __init__(self, cfg: G1MimicStuFutureCfg, sim_params, physics_engine, sim_device, headless):
@@ -45,6 +47,13 @@ class G1MimicFuture(G1MimicDistill):
         
         # Call parent constructor
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
+        
+        # V6.3+: Initialize action jerk tracking buffer (for anti-spasm penalty)
+        self.last_last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
+        
+        # Register jerk penalty in reward_scales if configured (scale=1.0 since it's already scaled in config)
+        if hasattr(cfg.rewards, 'scales') and hasattr(cfg.rewards.scales, 'action_jerk'):
+            self.reward_scales['action_jerk'] = cfg.rewards.scales.action_jerk
         
         # Fix motion difficulty initialization - should start at 10, not 100
         num_motions = self._motion_lib.num_motions()
@@ -431,9 +440,12 @@ class G1MimicFuture(G1MimicDistill):
         return info
     
     def reset_idx(self, env_ids):
-        """Override reset to include force curriculum updates."""
+        """Override reset to include force curriculum updates and action history reset."""
         # Call parent reset
         super().reset_idx(env_ids)
+        
+        # V6.3+: Reset action history for jerk calculation
+        self.last_last_actions[env_ids] = 0.
         
         # Update force curriculum for reset environments
         if self.enable_force_curriculum:
@@ -449,10 +461,14 @@ class G1MimicFuture(G1MimicDistill):
             self._calculate_ee_forces()
     
     def post_physics_step(self):
-        """Override post_physics_step to include force application."""
+        """Override post_physics_step to include force application and action tracking."""
         # Apply forces here since pre_physics_step seems to not be called
         if self.enable_force_curriculum:
             self._calculate_ee_forces()
+        
+        # V6.3+: Update action history for jerk calculation BEFORE parent post_physics_step
+        # (parent updates last_actions, we need last_last_actions = previous last_actions)
+        self.last_last_actions[:] = self.last_actions[:]
         
         # Call parent post_physics_step
         super().post_physics_step()
@@ -588,6 +604,31 @@ class G1MimicFuture(G1MimicDistill):
         if hasattr(self.cfg.motion, 'use_error_aware_sampling') and self.cfg.motion.use_error_aware_sampling:
             self._log_error_aware_sampling_progress()
             self._log_max_key_body_error_per_motion()
+    
+    # ============================= V6.3+ Action Jerk Penalty =============================
+    
+    def _reward_action_jerk(self):
+        """
+        Anti-spasm penalty: Penalizes rapid direction changes (oscillation) without 
+        penalizing smooth fast movements.
+        
+        Jerk = change in acceleration = (a_t - 2*a_{t-1} + a_{t-2})
+        
+        This is different from action_rate which penalizes ALL fast changes.
+        Jerk specifically catches back-and-forth oscillation patterns that cause
+        the robot to spasm during deployment.
+        
+        The teacher doesn't have this problem because it was trained with action_rate
+        penalty from the start - the student needs explicit jerk penalty to learn
+        the same temporal smoothness through DAgger.
+        """
+        # Compute discrete jerk (second derivative of action)
+        # jerk = a_t - 2*a_{t-1} + a_{t-2}
+        action_jerk = self.actions - 2 * self.last_actions + self.last_last_actions
+        
+        # Return sum of squared jerk (will be multiplied by negative scale = penalty)
+        jerk_penalty = torch.sum(action_jerk ** 2, dim=-1)
+        return jerk_penalty
 
     # ============================= FALCON Force Curriculum Methods =============================
     

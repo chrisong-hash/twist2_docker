@@ -235,3 +235,4 @@ echo "  cd $TWIST2_DIR/legged_gym"
 echo "  python legged_gym/scripts/train.py --task g1_priv_mimic_v7 --run_name v7_freeze --proj_name h1 --headless"
 echo ""
 
+

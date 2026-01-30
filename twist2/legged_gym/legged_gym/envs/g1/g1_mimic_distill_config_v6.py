@@ -366,3 +366,4 @@ class G1MimicPrivCfgPPOV6(HumanoidMimicCfgPPO):
         motion_latent_dim = 128
 
 
+

@@ -30,3 +30,4 @@ python server_motion_lib_v6_2.py \
     --redis_ip ${redis_ip}
 
 
+

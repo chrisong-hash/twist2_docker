@@ -73,6 +73,9 @@ from .g1.g1_mimic_future_config import G1MimicStuFutureCfg, G1MimicStuFutureCfgD
 # V6.2 Student: 0.5s future sight + higher dagger_coef
 from .g1.g1_mimic_future_config_v6_2 import G1MimicStuFutureCfgV6_2, G1MimicStuFutureCfgPPOV6_2
 
+# V6.3 Student: V6.2 + jerk penalty for anti-spasm behavior
+from .g1.g1_mimic_future_config_v6_3 import G1MimicStuFutureCfgV6_3, G1MimicStuFutureCfgPPOV6_3
+
 from legged_gym.gym_utils.task_registry import task_registry
 
 
@@ -85,6 +88,9 @@ task_registry.register("g1_stu_future", G1MimicFuture, G1MimicStuFutureCfg(), G1
 
 # V6.2 Student: 0.5s future sight for real-time deployment
 task_registry.register("g1_stu_future_v6_2", G1MimicFuture, G1MimicStuFutureCfgV6_2(), G1MimicStuFutureCfgPPOV6_2())
+
+# V6.3 Student: V6.2 + jerk penalty for anti-spasm behavior
+task_registry.register("g1_stu_future_v6_3", G1MimicFuture, G1MimicStuFutureCfgV6_3(), G1MimicStuFutureCfgPPOV6_3())
 
 # Strict termination experiment
 task_registry.register("g1_priv_mimic_strict", G1MimicDistill, G1MimicPrivStrictCfg(), G1MimicPrivStrictCfgPPO())
