@@ -213,8 +213,11 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             cfg_train.runner.algorithm_class_name = 'PPO'
 
         try:
-            cfg_train.runner.teacher_experiment_name = args.teacher_exptid
-            cfg_train.runner.teacher_checkpoint = args.teacher_checkpoint
+            # Only override if explicitly provided (not default)
+            if args.teacher_exptid is not None:
+                cfg_train.runner.teacher_experiment_name = args.teacher_exptid
+            if args.teacher_checkpoint is not None:
+                cfg_train.runner.teacher_checkpoint = args.teacher_checkpoint
         except:
             print(f"No distillation set; Ignore teacher exptid {args.teacher_exptid} and teacher checkpoint {args.teacher_checkpoint}")
             pass
@@ -306,7 +309,7 @@ def get_args():
         
         {"name": "--use_transformer", "action": "store_true", "default": False, "help": "use transformer"},
 
-        {"name": "--teacher_exptid", "type": str, "help": "teacher exptid", "default": "mimic"},
+        {"name": "--teacher_exptid", "type": str, "help": "teacher exptid", "default": None},
         {"name": "--teacher_checkpoint", "type": int, "help": "teacher checkpoint", "default": -1},
         {"name": "--eval_student", "action": "store_true", "default": False, "help": "eval student"},
         {"name": "--jit_path", "type": str, "help": "jit path", "default": None},
