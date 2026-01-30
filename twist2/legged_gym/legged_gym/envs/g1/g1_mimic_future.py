@@ -45,10 +45,13 @@ class G1MimicFuture(G1MimicDistill):
             self.episode_length_counter = None
             self.force_scale = None
         
+        # V6.3+: Initialize placeholder for jerk tracking (needed before super().__init__ because reset_idx is called)
+        self.last_last_actions = None
+        
         # Call parent constructor
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
         
-        # V6.3+: Initialize action jerk tracking buffer (for anti-spasm penalty)
+        # V6.3+: Now properly initialize action jerk tracking buffer (for anti-spasm penalty)
         self.last_last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         
         # Register jerk penalty in reward_scales if configured (scale=1.0 since it's already scaled in config)
@@ -444,8 +447,9 @@ class G1MimicFuture(G1MimicDistill):
         # Call parent reset
         super().reset_idx(env_ids)
         
-        # V6.3+: Reset action history for jerk calculation
-        self.last_last_actions[env_ids] = 0.
+        # V6.3+: Reset action history for jerk calculation (guard against None during init)
+        if self.last_last_actions is not None:
+            self.last_last_actions[env_ids] = 0.
         
         # Update force curriculum for reset environments
         if self.enable_force_curriculum:
