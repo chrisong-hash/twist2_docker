@@ -28,12 +28,10 @@ class G1MimicDistillFreeze(G1MimicDistill):
         
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
         
-        # Register custom reward scales so parent's logging doesn't crash
-        # These are already scaled when added to rew_buf, so set scale to 1.0 for logging
-        self.reward_scales['freeze_stability'] = 1.0
-        self.reward_scales['standing_still'] = 1.0
-        self.reward_scales['default_pose_tracking'] = 1.0
-        self.reward_scales['action_jerk'] = 1.0
+        # Register freeze_stability for logging (not auto-discovered since it's in cfg.freeze, not cfg.rewards.scales)
+        # Note: standing_still, default_pose_tracking, action_jerk are auto-discovered and don't need manual registration
+        self.reward_scales['freeze_stability'] = self._freeze_stability_bonus * self.dt
+        self.episode_sums['freeze_stability'] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         
     def _init_buffers(self):
         super()._init_buffers()
@@ -270,50 +268,29 @@ class G1MimicDistillFreeze(G1MimicDistill):
         return jerk_penalty
     
     def compute_reward(self):
-        """Override to add freeze stability, standing still, and default pose rewards."""
-        # Call parent reward computation
+        """Override to add freeze stability bonus only.
+        
+        Note: standing_still, default_pose_tracking, and action_jerk are AUTO-DISCOVERED
+        by the base class's _prepare_reward_function() because they:
+        1. Have methods _reward_<name> defined
+        2. Have non-zero scales in cfg.rewards.scales
+        
+        DO NOT manually add them here - that would double-count them!
+        
+        Only freeze_stability needs manual handling because it uses cfg.freeze.stability_bonus
+        instead of cfg.rewards.scales.
+        """
+        # Call parent reward computation (handles all auto-discovered rewards)
         super().compute_reward()
         
-        # Add freeze stability bonus if configured
+        # Add freeze stability bonus if configured (NOT auto-discovered)
         if self._freeze_stability_bonus > 0:
-            freeze_stability_rew = self._reward_freeze_stability() * self._freeze_stability_bonus
+            freeze_stability_rew = self._reward_freeze_stability() * self._freeze_stability_bonus * self.dt
             self.rew_buf += freeze_stability_rew
             
             # Log it
-            if hasattr(self, 'episode_sums') and 'freeze_stability' not in self.episode_sums:
-                self.episode_sums['freeze_stability'] = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
-            if hasattr(self, 'episode_sums'):
+            if hasattr(self, 'episode_sums') and 'freeze_stability' in self.episode_sums:
                 self.episode_sums['freeze_stability'] += freeze_stability_rew
-        
-        # Add standing still reward
-        if hasattr(self.cfg.rewards.scales, 'standing_still') and self.cfg.rewards.scales.standing_still > 0:
-            standing_still_rew = self._reward_standing_still() * self.cfg.rewards.scales.standing_still
-            self.rew_buf += standing_still_rew
-            
-            if hasattr(self, 'episode_sums'):
-                if 'standing_still' not in self.episode_sums:
-                    self.episode_sums['standing_still'] = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
-                self.episode_sums['standing_still'] += standing_still_rew
-        
-        # Add default pose tracking reward
-        if hasattr(self.cfg.rewards.scales, 'default_pose_tracking') and self.cfg.rewards.scales.default_pose_tracking > 0:
-            default_pose_rew = self._reward_default_pose_tracking() * self.cfg.rewards.scales.default_pose_tracking
-            self.rew_buf += default_pose_rew
-            
-            if hasattr(self, 'episode_sums'):
-                if 'default_pose_tracking' not in self.episode_sums:
-                    self.episode_sums['default_pose_tracking'] = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
-                self.episode_sums['default_pose_tracking'] += default_pose_rew
-        
-        # Add action jerk (anti-spasm) penalty
-        if hasattr(self.cfg.rewards.scales, 'action_jerk') and self.cfg.rewards.scales.action_jerk != 0:
-            action_jerk_rew = self._reward_action_jerk() * self.cfg.rewards.scales.action_jerk
-            self.rew_buf += action_jerk_rew
-            
-            if hasattr(self, 'episode_sums'):
-                if 'action_jerk' not in self.episode_sums:
-                    self.episode_sums['action_jerk'] = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
-                self.episode_sums['action_jerk'] += action_jerk_rew
     
     def get_freeze_stats(self):
         """Return freeze statistics for logging."""
