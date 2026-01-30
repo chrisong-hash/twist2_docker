@@ -233,8 +233,10 @@ class HumanoidMimic(HumanoidChar):
         # fill extras
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
+            # episode_sums already contains scaled rewards (raw * scale * dt from compute_reward)
+            # Don't multiply by reward_scales again - that was a bug causing double-scaling!
             self.extras["episode"]['metric_' + key] = torch.mean(self.episode_sums[key][env_ids] / self._motion_lib.get_motion_length(self._motion_ids[env_ids]))
-            self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids] * self.reward_scales[key] / self._motion_lib.get_motion_length(self._motion_ids[env_ids]))
+            self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids] / self._motion_lib.get_motion_length(self._motion_ids[env_ids]))
             self.episode_sums[key][env_ids] = 0.
         
         for key in self.episode_means.keys():
