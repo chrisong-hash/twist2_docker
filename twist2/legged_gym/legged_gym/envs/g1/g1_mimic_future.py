@@ -54,9 +54,10 @@ class G1MimicFuture(G1MimicDistill):
         # V6.3+: Now properly initialize action jerk tracking buffer (for anti-spasm penalty)
         self.last_last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         
-        # Register jerk penalty in reward_scales if configured (scale=1.0 since it's already scaled in config)
-        if hasattr(cfg.rewards, 'scales') and hasattr(cfg.rewards.scales, 'action_jerk'):
-            self.reward_scales['action_jerk'] = cfg.rewards.scales.action_jerk
+        # Note: action_jerk is AUTO-DISCOVERED by _prepare_reward_function() since:
+        # 1. _reward_action_jerk() method exists
+        # 2. cfg.rewards.scales.action_jerk is non-zero
+        # DO NOT manually register it here - that would overwrite the dt-scaled value!
         
         # Fix motion difficulty initialization - should start at 10, not 100
         num_motions = self._motion_lib.num_motions()
