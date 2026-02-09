@@ -45,3 +45,13 @@ Miniconda*.sh
 pip_cache/
 
 .cursorrulestwist2/robot_deploy/id_robot
+
+# Large data directories
+data/
+
+# Experiment logs
+twist2/logs_v*/
+**/logs_v*/
+
+# Backup archives
+*.tar.gz
