@@ -10,20 +10,20 @@
 SCRIPT_DIR=$(dirname $(realpath $0))
 
 # Default to V6.2 student policy (update this path after training)
-ckpt_path=${1:-${SCRIPT_DIR}/legged_gym/logs/h1/student_v6_2/model_6000.onnx}
+ckpt_path=${1:-${SCRIPT_DIR}/legged_gym/logs/h1/student_v6_2/model_15000.onnx}
 # ckpt_path=/home/robo/CodeSpace/twist2_docker/twist2/legged_gym/logs/h1/student_v6_2/model_6000.onnx
 
 echo "=============================================="
 echo "  Sim2Sim V6.2 (Real Future Observations)"
 echo "=============================================="
 echo "  Policy: ${ckpt_path}"
-echo "  Expected obs size: 2137 dims"
+echo "  Expected obs size: 1502 dims"
 echo "    - Current: 127 dims (35 mimic + 92 proprio)"
-echo "    - History: 1905 dims (15 × 127)"
+echo "    - History: 1270 dims (10 × 127)"
 echo "    - Future: 105 dims (3 × 35)"
 echo ""
-echo "  Make sure Motion Server V6.2 is running!"
-echo "  (bash run_motion_server_v6_2.sh)"
+echo "  Make sure Motion Server is running!"
+echo "  (bash run_motion_server_raw.sh)"
 echo "=============================================="
 
 cd deploy_real
@@ -34,6 +34,7 @@ python server_low_level_g1_sim_v6_2.py \
     --device cuda \
     --redis_ip localhost \
     --robot unitree_g1_with_hands
+
 
 
 

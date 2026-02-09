@@ -35,6 +35,7 @@ services:
       # Project mounts (essential)
       - ./isaacgym:/opt/isaacgym:ro
       - ./twist2:/workspace/twist2
+      - /home/robo/CodeSpace/BFM-Zero/logs:/workspace/twist2/logs
       - ./unitree_sdk2:/workspace/unitree_sdk2
       - ./GMR:/workspace/GMR
       

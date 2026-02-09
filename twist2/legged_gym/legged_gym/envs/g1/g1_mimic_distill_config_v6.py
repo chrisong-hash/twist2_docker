@@ -367,3 +367,5 @@ class G1MimicPrivCfgPPOV6(HumanoidMimicCfgPPO):
 
 
 
+
+

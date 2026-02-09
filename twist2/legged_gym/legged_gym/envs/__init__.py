@@ -70,11 +70,23 @@ from .g1.g1_mimic_distill_config_v7 import G1MimicPrivCfgV7, G1MimicPrivCfgPPOV7
 from .g1.g1_mimic_future import G1MimicFuture
 from .g1.g1_mimic_future_config import G1MimicStuFutureCfg, G1MimicStuFutureCfgDAgger
 
+# V6.1.1 Student: Pure L2 loss (not KL divergence) - same obs as V6.2
+from .g1.g1_mimic_future_config_v6_1_1 import G1MimicStuFutureCfgV6_1_1, G1MimicStuFutureCfgPPOV6_1_1
+
 # V6.2 Student: 0.5s future sight + higher dagger_coef
 from .g1.g1_mimic_future_config_v6_2 import G1MimicStuFutureCfgV6_2, G1MimicStuFutureCfgPPOV6_2
 
 # V6.3 Student: V6.2 + jerk penalty for anti-spasm behavior
 from .g1.g1_mimic_future_config_v6_3 import G1MimicStuFutureCfgV6_3, G1MimicStuFutureCfgPPOV6_3
+
+# V6.4 Student: State estimation (no future obs, estimates latent from history)
+from .g1.g1_mimic_future_config_v6_4 import G1MimicStuStateEstCfgV6_4, G1MimicStuStateEstCfgPPOV6_4
+
+# V6.4.1 Student: Privileged predictor (student actor = teacher structure)
+from .g1.g1_mimic_future_config_v6_4_1 import G1MimicStuPrivPredCfgV6_4_1, G1MimicStuPrivPredCfgPPOV6_4_1
+
+# V6.5 Student: Default architecture + jerk penalty
+from .g1.g1_mimic_distill_config_v6_5 import G1MimicStuCfgV6_5, G1MimicStuCfgPPOV6_5
 
 from legged_gym.gym_utils.task_registry import task_registry
 
@@ -86,11 +98,23 @@ task_registry.register("g1_priv_mimic", G1MimicDistill, G1MimicPrivCfg(), G1Mimi
 task_registry.register("g1_stu_rl", G1MimicDistill, G1MimicStuRLCfg(), G1MimicStuRLCfgDAgger())
 task_registry.register("g1_stu_future", G1MimicFuture, G1MimicStuFutureCfg(), G1MimicStuFutureCfgDAgger())
 
+# V6.1.1 Student: Pure L2 loss (not KL divergence) - same obs as V6.2
+task_registry.register("g1_stu_future_v6_1_1", G1MimicFuture, G1MimicStuFutureCfgV6_1_1(), G1MimicStuFutureCfgPPOV6_1_1())
+
 # V6.2 Student: 0.5s future sight for real-time deployment
 task_registry.register("g1_stu_future_v6_2", G1MimicFuture, G1MimicStuFutureCfgV6_2(), G1MimicStuFutureCfgPPOV6_2())
 
 # V6.3 Student: V6.2 + jerk penalty for anti-spasm behavior
 task_registry.register("g1_stu_future_v6_3", G1MimicFuture, G1MimicStuFutureCfgV6_3(), G1MimicStuFutureCfgPPOV6_3())
+
+# V6.4 Student: State estimation (no future obs, estimates latent from history)
+task_registry.register("g1_stu_state_est_v6_4", G1MimicDistill, G1MimicStuStateEstCfgV6_4(), G1MimicStuStateEstCfgPPOV6_4())
+
+# V6.4.1 Student: Privileged predictor (student actor = teacher structure)
+task_registry.register("g1_stu_priv_pred_v6_4_1", G1MimicDistill, G1MimicStuPrivPredCfgV6_4_1(), G1MimicStuPrivPredCfgPPOV6_4_1())
+
+# V6.5 Student: Default architecture + jerk penalty (best of both)
+task_registry.register("g1_stu_v6_5", G1MimicDistill, G1MimicStuCfgV6_5(), G1MimicStuCfgPPOV6_5())
 
 # Strict termination experiment
 task_registry.register("g1_priv_mimic_strict", G1MimicDistill, G1MimicPrivStrictCfg(), G1MimicPrivStrictCfgPPO())

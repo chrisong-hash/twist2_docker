@@ -33,3 +33,5 @@ from .actor_critic_mimic import ActorCriticMimic
 from .dagger_actor import DAggerActor
 from .actor_critic_teleop import ActorCriticTeleop
 from .actor_critic_future import ActorCriticFuture
+from .actor_critic_state_est import ActorCriticStateEst  # V6.4: State estimation
+from .actor_critic_priv_predictor import ActorCriticPrivPredictor  # V6.4.1: Priv prediction

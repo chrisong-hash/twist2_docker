@@ -307,3 +307,5 @@ class G1MimicPrivStrictCfgPPO(HumanoidMimicCfgPPO):
 
 
 
+
+

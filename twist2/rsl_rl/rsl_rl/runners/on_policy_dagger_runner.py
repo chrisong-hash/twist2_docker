@@ -134,6 +134,31 @@ class OnPolicyDaggerRunner:
                                         num_history_steps=self.env.cfg.env.history_len,
                                         num_actions=self.env.num_actions,
                                         **self.policy_cfg).to(self.device)
+        elif "StateEst" in self.cfg["policy_class_name"]:
+            # V6.4: State estimation architecture
+            n_obs_single = self.env.cfg.env.n_mimic_obs + self.env.cfg.env.n_proprio
+            actor_critic = policy_class(num_observations=self.env.num_obs,
+                                        num_single_obs=n_obs_single,
+                                        num_history_steps=self.env.cfg.env.history_len,
+                                        num_actions=self.env.num_actions,
+                                        num_critic_obs=self.env.num_privileged_obs,
+                                        **self.policy_cfg).to(self.device)
+        elif "PrivPredictor" in self.cfg["policy_class_name"]:
+            # V6.4.1: Privileged predictor (student actor = teacher structure)
+            actor_critic = policy_class(
+                # Teacher's full privileged obs structure
+                num_priv_obs=self.env.num_privileged_obs,
+                n_priv_mimic_obs=self.env.cfg.env.n_priv_mimic_obs,
+                n_proprio=self.env.cfg.env.n_proprio,
+                n_priv_info=self.env.cfg.env.n_priv_info,
+                # Student's limited obs
+                num_student_obs=self.env.num_obs,
+                n_mimic_obs=self.env.cfg.env.n_mimic_obs,
+                num_history_steps=self.env.cfg.env.history_len,
+                # Actions
+                num_actions=self.env.num_actions,
+                **self.policy_cfg
+            ).to(self.device)
         else:
             actor_critic = policy_class(num_observations=self.env.num_obs,
                                         num_critic_observations=self.env.num_privileged_obs,

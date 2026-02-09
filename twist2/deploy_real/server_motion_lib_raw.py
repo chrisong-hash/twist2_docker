@@ -244,6 +244,12 @@ def main(args, xml_file, robot_base):
             
             # Publish RAW motion data (for buffered server to process)
             redis_client.set(f"motion_raw_{args.robot}", json.dumps(mimic_obs_list))
+            
+            # ALSO publish directly to action_body and action_mimic_future for sim2sim
+            # This allows the low-level controller to use ACTUAL future frames (not buffered)
+            redis_client.set(f"action_body_{args.robot}", json.dumps(mimic_obs_list))
+            redis_client.set(f"action_mimic_future_{args.robot}", json.dumps(future_obs_list))
+            
             redis_client.set(f"action_hand_left_{args.robot}", json.dumps(np.zeros(7).tolist()))
             redis_client.set(f"action_hand_right_{args.robot}", json.dumps(np.zeros(7).tolist()))
             redis_client.set(f"action_neck_{args.robot}", json.dumps(np.zeros(2).tolist()))

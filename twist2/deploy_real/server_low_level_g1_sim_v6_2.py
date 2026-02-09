@@ -133,21 +133,22 @@ class SimControllerV6_2:
         print(f"  control_dt: {self.control_dt}s ({1/self.control_dt:.0f}Hz)")
         print(f"  sim_decimation: {self.sim_decimation} steps @ {self.sim_dt}s")
         
-        # PD gains - MATCH TRAINING CONFIG v6.py
-        # Left leg: hip_yaw(100), hip_roll(100), hip_pitch(100), knee(150), ankle(40), ankle(40)
+        # PD gains - TUNED FOR DEPLOYMENT (matches original sim2sim)
+        # Note: Wrist joints use LOWER stiffness (4.0) to prevent aggressive tracking
+        # Left leg: hip(100), hip(100), hip(100), knee(150), ankle(40), ankle(40)
         # Right leg: same
         # Waist: 3x 150
-        # Arms: 7x 40 each
+        # Arms: shoulder(40)*3, elbow(40), wrist(4.0)*3
         self.kps = np.array([100, 100, 100, 150, 40, 40,    # Left leg
                             100, 100, 100, 150, 40, 40,     # Right leg  
                             150, 150, 150,                   # Waist
-                            40, 40, 40, 40, 40, 40, 40,     # Left arm
-                            40, 40, 40, 40, 40, 40, 40], dtype=np.float32)
+                            40, 40, 40, 40, 4.0, 4.0, 4.0,  # Left arm (wrist=4.0)
+                            40, 40, 40, 40, 4.0, 4.0, 4.0], dtype=np.float32)  # Right arm (wrist=4.0)
         self.kds = np.array([2, 2, 2, 4, 2, 2,              # Left leg
                             2, 2, 2, 4, 2, 2,               # Right leg
                             4, 4, 4,                         # Waist
-                            5, 5, 5, 5, 5, 5, 5,            # Left arm
-                            5, 5, 5, 5, 5, 5, 5], dtype=np.float32)
+                            5, 5, 5, 5, 2.0, 2.0, 2.0,      # Left arm (wrist=2.0)
+                            5, 5, 5, 5, 2.0, 2.0, 2.0], dtype=np.float32)  # Right arm (wrist=2.0)
         
         self.record_video = record_video
         self.record_proprio = record_proprio

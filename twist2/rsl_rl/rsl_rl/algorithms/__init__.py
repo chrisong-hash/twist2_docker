@@ -31,4 +31,7 @@
 from .ppo import PPO
 from .dagger import DAgger
 from .dagger_ppo import DaggerPPO
+from .dagger_l2_ppo import DAggerL2PPO  # V6.1.1: Pure L2 loss instead of KL divergence
+from .dagger_state_est import DAggerStateEst  # V6.4: State estimation
+from .dagger_priv_predictor import DAggerPrivPredictor  # V6.4.1: Privileged prediction
 # Removed unnecessary maskedmimic algorithms

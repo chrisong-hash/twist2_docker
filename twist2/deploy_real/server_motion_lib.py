@@ -239,6 +239,11 @@ def main(args, xml_file, robot_base):
             
             t_step += 1
             if t_step >= num_steps:
+                if args.loop:
+                    # Loop back to beginning
+                    t_step = 0
+                    print(f"\n[Motion Server] Looping motion (restarting from frame 0)...")
+                else:
                 break
             # Sleep to maintain real-time pace
             elapsed = time.time() - t0
@@ -291,8 +296,11 @@ if __name__ == "__main__":
     parser.add_argument("--use_remote_control", action="store_true", help="Use remote control signals from robot controller")
     parser.add_argument("--send_start_frame_as_end_frame", action="store_true", help="Use motion's first frame as end frame instead of default pose")
     parser.add_argument("--redis_ip", type=str, default="localhost", help="Redis IP")
+    parser.add_argument("--loop", action="store_true", help="Loop the motion continuously")
     args = parser.parse_args()
 
+    # Only force vis=True if not looping (looping mode can run headless)
+    if not args.loop:
     args.vis = True
     
 

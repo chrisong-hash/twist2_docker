@@ -20,6 +20,10 @@ class G1MimicDistill(HumanoidMimic):
         self.last_feet_z = 0.05
         self.episode_length = torch.zeros((self.num_envs), device=self.device)
         self.feet_height = torch.zeros((self.num_envs, 2), device=self.device)
+        
+        # Buffer for jerk penalty (action_jerk = a_t - 2*a_{t-1} + a_{t-2})
+        self.last_last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device)
+        
         self.reset_idx(torch.tensor(range(self.num_envs), device=self.device))
         if self.obs_type == 'student':
             self.total_env_steps_counter = 24 * 100000
@@ -311,3 +315,24 @@ class G1MimicDistill(HumanoidMimic):
     
     def _reward_ankle_action(self):
         return torch.norm(self.action_history_buf[:, -1, [4, 5, 10, 11]], dim=1)
+
+    def _reward_action_jerk(self):
+        """
+        V6.5+: Penalize action jerk (second derivative) to reduce oscillation/spasming.
+        
+        Jerk = a_t - 2*a_{t-1} + a_{t-2}
+        
+        Unlike action_rate which penalizes any change, jerk specifically catches
+        oscillation (back-and-forth movement) while allowing smooth fast movements.
+        """
+        action_jerk = self.actions - 2 * self.last_actions + self.last_last_actions
+        jerk_penalty = torch.sum(action_jerk ** 2, dim=-1)
+        return jerk_penalty
+
+    def post_physics_step(self):
+        """Override post_physics_step to track action history for jerk calculation."""
+        # Update last_last_actions BEFORE parent updates last_actions
+        self.last_last_actions[:] = self.last_actions[:]
+        
+        # Call parent post_physics_step
+        super().post_physics_step()

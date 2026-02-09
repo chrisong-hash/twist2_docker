@@ -62,3 +62,4 @@ twist2/test_*.sh
 
 # Inspire hand meshes (copied from XRoboToolkit, large binary files)
 twist2/deploy_real/inspire_hand/
+twist2/models_backup.tar.gz

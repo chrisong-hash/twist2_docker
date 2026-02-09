@@ -236,3 +236,5 @@ echo "  python legged_gym/scripts/train.py --task g1_priv_mimic_v7 --run_name v7
 echo ""
 
 
+
+
