@@ -55,3 +55,6 @@ twist2/logs_v*/
 
 # Backup archives
 *.tar.gz
+
+# External hand models
+twist2/deploy_real/inspire_hand/
