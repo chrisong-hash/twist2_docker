@@ -513,6 +513,15 @@ class RealTimePolicyController(object):
                     else:
                         vel_cmd = np.zeros(3, dtype=np.float32)
                     
+                    # Debug: print velocity received every ~2 seconds
+                    if not hasattr(self, '_vel_debug_count'):
+                        self._vel_debug_count = 0
+                    self._vel_debug_count += 1
+                    if self._vel_debug_count % 100 == 1:
+                        any_nonzero = np.any(np.abs(vel_cmd) > 0.01)
+                        if any_nonzero:
+                            print(f"[VEL] Received: vx={vel_cmd[0]:+.3f} vy={vel_cmd[1]:+.3f} vyaw={vel_cmd[2]:+.3f} | state={teleop_state} loco={locomotion_active}")
+                    
                     # Use locomotion policy if locomotion_active OR state == "teleop_loco"
                     use_locomode = (locomotion_active or teleop_state == "teleop_loco") and not in_startup_grace
                     
@@ -521,6 +530,8 @@ class RealTimePolicyController(object):
                     if use_locomode and not was_in_locomode:
                         # Switching TO LocoMode - reset policy buffers
                         self.loco_policy.reset()
+                        # Freeze arm position when entering locomotion mode
+                        self._frozen_arm_pos = target_dof_pos[15:29].copy()
                     self._was_in_locomode = use_locomode
                     
                     # Debug: print state changes
@@ -536,9 +547,25 @@ class RealTimePolicyController(object):
                     if use_locomode:
                         # LOCOMOTION MODE: Use GearWBC or LocoMode for lower body
                         if getattr(self, 'use_gear_wbc', False):
+                            # Lean compensation based on arm (hand) position
+                            # When hands are close to body -> more forward pitch compensation
+                            # When hands are extended forward -> less compensation (CoG already shifted)
+                            # Forward lean is positive pitch
+                            arm_pos = self._frozen_arm_pos if hasattr(self, '_frozen_arm_pos') else target_dof_pos[15:29]
+                            arm_default = self.default_dof_pos[15:29]
+                            arm_deviation = np.linalg.norm(arm_pos - arm_default)
+                            
+                            min_lean_pitch = 0.05   # min forward lean when arms extended (radians)
+                            max_lean_pitch = 0.10   # max forward lean when arms close to body (radians)
+                            max_arm_deviation = 2.0  # approx max norm when arms fully extended
+                            extension_ratio = np.clip(arm_deviation / max_arm_deviation, 0.0, 1.0)
+                            lean_pitch = max_lean_pitch - (max_lean_pitch - min_lean_pitch) * extension_ratio
+                            
+                            torso_rpy = np.array([0.0, lean_pitch, 0.0])
+                            
                             # GearWBC: takes quat directly, outputs 15 DOF (legs + waist)
                             loco_action, loco_kps, loco_kds = self.loco_policy.compute(
-                                dof_pos, dof_vel, ang_vel, quat, vel_cmd, torso_rpy=None
+                                dof_pos, dof_vel, ang_vel, quat, vel_cmd, torso_rpy=torso_rpy
                             )
                             
                             # GearWBC target: legs + waist from policy, arms FROZEN
