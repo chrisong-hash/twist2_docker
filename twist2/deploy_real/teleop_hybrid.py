@@ -34,10 +34,10 @@ States:
   teleop_loco  : Walk mode (legs walk, arms track)
   paused       : MuJoCo tracks, but robot FREEZES (reposition freely)
 
-KEY BEHAVIOR (matches original TWIST2):
+KEY BEHAVIOR:
   - Direct tracking: mimic_obs passed through directly
-  - Robot does NOT rotate when you rotate (waist_yaw at index 20 locked at 0)
-  - Yaw rotation ONLY from joystick in walk mode
+  - Body rotation enabled in teleop_full (robot turns when you rotate)
+  - In teleop_loco (walk mode), rotation from joystick only
 
 All mode transitions have smooth 1-second interpolation.
 """
@@ -436,6 +436,21 @@ class HybridLocoTeleop:
         self.smooth_window_size = args.smooth_window_size
         self.smooth_history = []  # Store recent observations for sliding window
         
+        # Velocity scaling (to match GROOT's intended walking speed range)
+        # GROOT original Joycon uses MAX_LINEAR_VEL=0.2, which after cmd_scale [2.0, 2.0, 0.5]
+        # gives reasonable speeds. Without scaling, joystick at 1.0 would be way too fast.
+        self.vel_scale_forward = args.vel_scale_forward     # Max forward vel
+        self.vel_scale_backward = args.vel_scale_backward   # Max backward vel (more conservative)
+        self.vel_scale_strafe = args.vel_scale_strafe       # Max strafe vel
+        self.vel_scale_yaw = args.vel_scale_yaw             # Max yaw vel
+        
+        # Backward stop recovery: if robot was walking backward and stops,
+        # inject a brief forward impulse to help it regain balance
+        self._was_walking_backward = False
+        self._backward_stop_time = None
+        self._backward_recovery_duration = 0.5  # seconds of forward nudge
+        self._backward_recovery_speed = 0.10    # forward vel during recovery
+        
         # Calibration offset system - when entering teleop, store user's pose as "zero reference"
         # Robot movements are relative to this calibration, not absolute
         self.calibration_mimic_obs = None  # User's pose when entering teleop
@@ -456,6 +471,15 @@ class HybridLocoTeleop:
             print(f"[cyan]Smooth filtering: ENABLED (window size: {self.smooth_window_size} frames)[/cyan]")
         else:
             print("[yellow]Smooth filtering: DISABLED[/yellow]")
+        
+        # Print velocity scaling info
+        print(f"\n[cyan]Velocity scaling (for GROOT GearWBC compatibility):[/cyan]")
+        print(f"  Forward:  {self.vel_scale_forward:.2f} → max {self.vel_scale_forward * 2.0:.1f} m/s")
+        print(f"  Backward: {self.vel_scale_backward:.2f} → max {self.vel_scale_backward * 2.0:.1f} m/s")
+        print(f"  Strafe:   {self.vel_scale_strafe:.2f} → max {self.vel_scale_strafe * 2.0:.1f} m/s")
+        print(f"  Yaw:      {self.vel_scale_yaw:.2f} → max {self.vel_scale_yaw * 0.5:.2f} rad/s")
+        print(f"  [yellow]Tune with --vel_scale_forward, --vel_scale_backward, etc.[/yellow]")
+        
         self._print_controls()
     
     def _setup_locomotion_policy(self):
@@ -543,6 +567,11 @@ class HybridLocoTeleop:
                 timeout=3.0
             )
             
+            # Set force limit to prevent fingers getting stuck
+            force_limit = getattr(self.args, 'hand_force_limit', 500)
+            print(f"    Setting force limit: {force_limit}")
+            self.inspire_hand_controller.set_force_limit(force_limit)
+            
             # Open both hands initially
             time.sleep(0.5)
             self.inspire_hand_controller.open_both()
@@ -626,8 +655,8 @@ class HybridLocoTeleop:
         print("  teleop_loco : Walk mode (legs walk, arms track)")
         print("  paused      : MuJoCo tracks, robot FROZEN (reposition freely)")
         print("\n[cyan]Key behavior:[/cyan]")
-        print("  - Direct tracking (like original TWIST2)")
-        print("  - Robot does NOT rotate when you rotate (waist_yaw[20] locked)")
+        print("  - Direct tracking with body rotation enabled")
+        print("  - Robot turns when you rotate in teleop_full mode")
         print("  - Thumb lags 0.25s behind fingers when closing")
         print("="*60 + "\n")
     
@@ -824,6 +853,7 @@ class HybridLocoTeleop:
                 elif self.state == "preview":
                     # Instant transition - MuJoCo was already tracking
                     self.state = "teleop_full"
+                    # Neck filter should already be warmed up from preview
                     print("\n[green]→ TELEOP_FULL active[/green]")
                 elif self.state in ["teleop_full", "teleop_loco"]:
                     self.previous_teleop_state = self.state
@@ -905,13 +935,42 @@ class HybridLocoTeleop:
         left_axis = left_ctrl.get("axis", [0, 0])
         right_axis = right_ctrl.get("axis", [0, 0])
         
-        # Only active in teleop_loco (walk mode)
+        # Only active in teleop_loco (walk mode) - with velocity scaling for GROOT compatibility
         if self.state == "teleop_loco" or (self.is_interpolating and self.interp_to_state == "teleop_loco"):
-            self.vel_cmd[0] = left_axis[1] if len(left_axis) > 1 else 0.0
-            self.vel_cmd[1] = -left_axis[0] if len(left_axis) > 0 else 0.0
-            self.vel_cmd[2] = -right_axis[0] if len(right_axis) > 0 else 0.0
+            # GROOT policy expects raw commands in ~0.2 range, not 0-1
+            raw_forward = left_axis[1] if len(left_axis) > 1 else 0.0
+            raw_strafe = -left_axis[0] if len(left_axis) > 0 else 0.0
+            raw_yaw = -right_axis[0] if len(right_axis) > 0 else 0.0
+            
+            # Apply asymmetric scaling for forward vs backward (backward is less stable)
+            if raw_forward >= 0:
+                self.vel_cmd[0] = raw_forward * self.vel_scale_forward
+            else:
+                self.vel_cmd[0] = raw_forward * self.vel_scale_backward
+            
+            self.vel_cmd[1] = raw_strafe * self.vel_scale_strafe
+            self.vel_cmd[2] = raw_yaw * self.vel_scale_yaw
+            
+            # Backward stop recovery: detect when backward walking stops
+            is_walking_backward = self.vel_cmd[0] < -0.02
+            just_stopped_backward = self._was_walking_backward and not is_walking_backward
+            self._was_walking_backward = is_walking_backward
+            
+            if just_stopped_backward:
+                self._backward_stop_time = time.time()
+            
+            # Inject forward impulse during recovery window
+            if self._backward_stop_time is not None:
+                elapsed = time.time() - self._backward_stop_time
+                if elapsed < self._backward_recovery_duration and self.vel_cmd[0] <= 0.02:
+                    # Only apply if user isn't already pushing forward
+                    self.vel_cmd[0] = self._backward_recovery_speed
+                else:
+                    self._backward_stop_time = None
         else:
             self.vel_cmd[:] = 0.0
+            self._was_walking_backward = False
+            self._backward_stop_time = None
     
     def _validate_quaternions(self, smplx_data):
         """Check if smplx_data contains valid quaternions (non-zero norm)"""
@@ -1210,7 +1269,23 @@ class HybridLocoTeleop:
                 # Auto-transition from idle to preview when data arrives
                 if self.state == "idle" and smplx_data is not None:
                     self.state = "preview"
-                    print("\n→ PREVIEW mode: Pico data received!")
+                    # Initialize neck filter and spike rejection state
+                    self._neck_filter_yaw = 0.0
+                    self._neck_filter_pitch = 0.0
+                    self._neck_last_raw_yaw = 0.0
+                    self._neck_last_raw_pitch = 0.0
+                    # Capture current neck position as "zero" offset (calibration)
+                    # This corrects for Pico tracking drift - user should be looking straight ahead
+                    try:
+                        raw_yaw, raw_pitch = human_head_to_robot_neck(smplx_data)
+                        self._neck_offset_yaw = raw_yaw
+                        self._neck_offset_pitch = raw_pitch
+                        print(f"\n→ PREVIEW mode: Pico data received!")
+                        print(f"   Neck calibrated: offset yaw={raw_yaw:.3f} ({np.degrees(raw_yaw):.1f}°), pitch={raw_pitch:.3f} ({np.degrees(raw_pitch):.1f}°)")
+                    except:
+                        self._neck_offset_yaw = 0.0
+                        self._neck_offset_pitch = 0.0
+                        print("\n→ PREVIEW mode: Pico data received!")
                 
                 # Send velocity commands if in teleop states
                 if self._is_teleop_state():
@@ -1229,6 +1304,7 @@ class HybridLocoTeleop:
                         qpos[7:7+12] = self.loco_policy.default_angles_reorder[:12]  # Legs
                         qpos[7+12:7+15] = self.loco_policy.default_angles_reorder[12:15]  # Waist
                         # Arms (7+15:7+29) keep GMR tracking from qpos
+                        
                     # idle, preview, teleop_full, paused: MuJoCo tracks GMR directly
                     # (paused = MuJoCo tracks but robot frozen / not sending to Redis)
                     
@@ -1250,16 +1326,11 @@ class HybridLocoTeleop:
                     # Apply smooth filtering to reduce jitter
                     mimic_obs = self.apply_smooth(mimic_obs)
                     
-                    # SIMPLIFIED: No calibration offset (matches original TWIST2)
-                    # Just pass through mimic_obs directly, but prevent unwanted rotation
-                    if mimic_obs is not None:
-                        # Indices: [0:2]=vel_xy, [2]=height, [3:5]=roll_pitch, [5]=yaw_vel, [6:35]=joints
-                        # Joints: [6:12]=left_leg, [12:18]=right_leg, [18:21]=torso, [21:28]=left_arm, [28:35]=right_arm
-                        # Torso order: [18]=torso_pitch, [19]=waist_roll, [20]=waist_yaw
-                        
-                        # ANTI-ROTATION: Force waist_yaw (index 20) to 0
-                        # This prevents the robot from rotating when the human rotates their torso
-                        mimic_obs[20] = 0.0  # waist_yaw = 0
+                    # Pass through mimic_obs - let body rotation work
+                    # Indices: [0:2]=vel_xy, [2]=height, [3:5]=roll_pitch, [5]=yaw_vel, [6:35]=joints
+                    # Joint indices in mimic_obs: 
+                    #   [6:18]=legs, [18:21]=waist (yaw,pitch,roll), [21:35]=arms
+                    # Waist: mimic_obs[18]=yaw, mimic_obs[19]=pitch, mimic_obs[20]=roll
                     
                     # Upper body freeze: capture arm positions on request
                     if self._capture_frozen_arms and mimic_obs is not None:
@@ -1273,20 +1344,19 @@ class HybridLocoTeleop:
                         mimic_obs[21:35] = self.frozen_arm_obs
                     
                     # === YAW CONTROL ===
-                    # Robot yaw is NOT controlled by human body rotation!
-                    # - teleop_full (balance): yaw velocity = 0 (robot stays facing same direction)
-                    # - teleop_loco (walk): yaw velocity from joystick only
+                    # - teleop_full (balance): yaw velocity passes through from body tracking
+                    # - teleop_loco (walk): yaw velocity from joystick
                     # Note: During interpolation, check target state, not current state
                     if mimic_obs is not None:
                         effective_state = self.interp_to_state if self.is_interpolating else self.state
                         if effective_state == "teleop_full":
-                            # Balance mode: no yaw rotation (robot stays put)
-                            mimic_obs[5] = 0.0
+                            # Balance mode: body rotation passes through (robot follows your rotation)
+                            pass  # Let mimic_obs[5] come from GMR body tracking
                         elif effective_state == "teleop_loco":
                             # Walk mode: yaw from joystick (vel_cmd[2])
                             mimic_obs[5] = self.vel_cmd[2]
                         else:
-                            # For other states (idle, preview, paused), also no rotation
+                            # For other states (idle, preview, paused), no rotation
                             mimic_obs[5] = 0.0
                     
                     # Get neck data from head tracking
@@ -1299,7 +1369,49 @@ class HybridLocoTeleop:
                         NECK_PITCH_LIMIT = 0.77  # ~44 degrees in radians
                         neck_yaw = float(np.clip(neck_yaw, -NECK_YAW_LIMIT, NECK_YAW_LIMIT))
                         neck_pitch = float(np.clip(neck_pitch, -NECK_PITCH_LIMIT, NECK_PITCH_LIMIT))
-                        neck_data = [neck_yaw, neck_pitch]
+                        
+                        # Apply neck offset calibration (captured when entering preview)
+                        # This zeros out Pico tracking drift
+                        if not hasattr(self, '_neck_offset_yaw'):
+                            self._neck_offset_yaw = 0.0
+                            self._neck_offset_pitch = 0.0
+                        
+                        # Apply offset correction
+                        neck_yaw_corrected = neck_yaw - self._neck_offset_yaw
+                        neck_pitch_corrected = neck_pitch - self._neck_offset_pitch
+                        
+                        # Apply neck stabilization filter to prevent sudden jumps
+                        if not hasattr(self, '_neck_filter_yaw'):
+                            # Initialize filter state (will be reset to 0 on preview entry)
+                            self._neck_filter_yaw = 0.0
+                            self._neck_filter_pitch = 0.0
+                            self._neck_last_raw_yaw = 0.0
+                            self._neck_last_raw_pitch = 0.0
+                        
+                        # SPIKE REJECTION: If value jumps more than 0.26 rad (15°) in one frame, ignore it
+                        # This handles Pico tracking glitches
+                        MAX_DELTA_PER_FRAME = 0.26  # ~15 degrees
+                        yaw_delta = abs(neck_yaw_corrected - self._neck_last_raw_yaw)
+                        pitch_delta = abs(neck_pitch_corrected - self._neck_last_raw_pitch)
+                        
+                        if yaw_delta > MAX_DELTA_PER_FRAME:
+                            neck_yaw_corrected = self._neck_last_raw_yaw  # Use previous value
+                        else:
+                            self._neck_last_raw_yaw = neck_yaw_corrected
+                            
+                        if pitch_delta > MAX_DELTA_PER_FRAME:
+                            neck_pitch_corrected = self._neck_last_raw_pitch  # Use previous value
+                        else:
+                            self._neck_last_raw_pitch = neck_pitch_corrected
+                        
+                        # Low-pass filter: new = alpha * raw + (1-alpha) * old
+                        # Use moderate filtering (alpha=0.12) for responsive but smooth motion
+                        NECK_FILTER_ALPHA = 0.12
+                        self._neck_filter_yaw = NECK_FILTER_ALPHA * neck_yaw_corrected + (1 - NECK_FILTER_ALPHA) * self._neck_filter_yaw
+                        self._neck_filter_pitch = NECK_FILTER_ALPHA * neck_pitch_corrected + (1 - NECK_FILTER_ALPHA) * self._neck_filter_pitch
+                        
+                        # Use filtered values
+                        neck_data = [self._neck_filter_yaw, self._neck_filter_pitch]
                     except Exception as e:
                         # Only log error once
                         if not hasattr(self, '_neck_error_logged'):
@@ -1367,6 +1479,37 @@ def parse_args():
         type=str,
         default="192.168.123.211",
         help="IP address for right Inspire hand.",
+    )
+    parser.add_argument(
+        "--hand_force_limit",
+        type=int,
+        default=500,
+        help="Inspire hand force limit (0-3000, default 500).",
+    )
+    # Velocity scaling (matching GROOT original: MAX_LINEAR_VEL=0.2, MAX_ANGULAR_VEL=0.5)
+    parser.add_argument(
+        "--vel_scale_forward",
+        type=float,
+        default=0.35,
+        help="Forward velocity scale (joystick 1.0 → this m/s). Default: 0.35",
+    )
+    parser.add_argument(
+        "--vel_scale_backward",
+        type=float,
+        default=0.15,
+        help="Backward velocity scale (lower for stability). GROOT original: 0.2",
+    )
+    parser.add_argument(
+        "--vel_scale_strafe",
+        type=float,
+        default=0.2,
+        help="Strafe velocity scale. GROOT original: 0.2",
+    )
+    parser.add_argument(
+        "--vel_scale_yaw",
+        type=float,
+        default=0.4,
+        help="Yaw velocity scale. GROOT original: 0.5",
     )
     return parser.parse_args()
 

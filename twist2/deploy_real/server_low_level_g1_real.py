@@ -371,15 +371,29 @@ class RealTimePolicyController(object):
                         self.redis_client.delete("robot_shutdown")
                         break
 
-                # Send remote control signals to Redis for motion server
+                # Send remote control signals to Redis for motion server and teleop
                 if self.redis_client:
+                    # Read full controller state
+                    controller = self.env.read_controller_input()
+                    
                     # Send B button status (for motion start)
-                    b_pressed = self.env.read_controller_input().keys == self.env.controller_mapping["B"]
+                    b_pressed = controller.keys == self.env.controller_mapping["B"]
                     self.redis_client.set("motion_start_signal", "1" if b_pressed else "0")
                     
                     # Send Select button status (for motion exit)
-                    select_pressed = self.env.read_controller_input().keys == self.env.controller_mapping["select"]
+                    select_pressed = controller.keys == self.env.controller_mapping["select"]
                     self.redis_client.set("motion_exit_signal", "1" if select_pressed else "0")
+                    
+                    # Publish full Unitree controller state for teleop state control
+                    # Joystick values: lx, ly = left stick, rx, ry = right stick
+                    controller_state = {
+                        "keys": controller.keys,
+                        "lx": float(controller.lx) if hasattr(controller, 'lx') else 0.0,
+                        "ly": float(controller.ly) if hasattr(controller, 'ly') else 0.0,
+                        "rx": float(controller.rx) if hasattr(controller, 'rx') else 0.0,
+                        "ry": float(controller.ry) if hasattr(controller, 'ry') else 0.0,
+                    }
+                    self.redis_client.set("unitree_controller", json.dumps(controller_state))
                     
                 if self.env.read_controller_input().keys == self.env.controller_mapping["select"]:
                     print("Select pressed, exiting main loop.")

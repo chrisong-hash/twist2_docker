@@ -57,13 +57,13 @@ start_peripherals() {
     
     # Kill any existing peripheral process
     echo "    Killing existing processes..."
-    ssh -n ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} 'pkill -f robot_peripherals.py 2>/dev/null; exit 0'
+    ssh -n ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} 'pkill -f robot_peripherals.py 2>/dev/null; pkill -f run_peripherals.sh 2>/dev/null; exit 0'
     sleep 1
     
-    # Start peripherals with logging (use ssh -f to fork SSH to background)
+    # Start peripherals via run_peripherals.sh (reads neck_config.json for calibration)
     echo "    Launching peripheral script..."
     LOG_FILE="peripheral_\$(date +%Y%m%d_%H%M%S).log"
-    ssh -f ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} "cd ~ && python3 robot_peripherals.py --redis ${PC_IP} > ~/logs/${LOG_FILE} 2>&1"
+    ssh -f ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} "cd ~ && REDIS_HOST=${PC_IP} ./run_peripherals.sh > ~/logs/${LOG_FILE} 2>&1"
     
     sleep 3
     
@@ -81,7 +81,7 @@ start_peripherals() {
 stop_peripherals() {
     echo ""
     echo "[3/3] Stopping peripherals on robot..."
-    ssh -n ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} 'pkill -f robot_peripherals.py 2>/dev/null; exit 0' || true
+    ssh -n ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} 'pkill -f robot_peripherals.py 2>/dev/null; pkill -f run_peripherals.sh 2>/dev/null; exit 0' || true
     echo "[✓] Peripherals stopped"
 }
 

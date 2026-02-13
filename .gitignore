@@ -28,7 +28,7 @@ logs/
 *.ckpt
 *.pt
 *.pth
-
+data/*
 # Temporary files
 .DS_Store
 Thumbs.db
@@ -44,17 +44,16 @@ Miniconda*.sh
 # Pip cache for Docker builds
 pip_cache/
 
-.cursorrulestwist2/robot_deploy/id_robot
+.cursorrules
+twist2/robot_deploy/id_robot
 
-# Large data directories
-data/
+# Calibration files (user-specific)
+**/thumb_calibration.json
+**/*_calibration.json
 
-# Experiment logs
-twist2/logs_v*/
-**/logs_v*/
+# Test files created during debugging
+twist2/deploy_real/test_*.py
+twist2/test_*.sh
 
-# Backup archives
-*.tar.gz
-
-# External hand models
+# Inspire hand meshes (copied from XRoboToolkit, large binary files)
 twist2/deploy_real/inspire_hand/
