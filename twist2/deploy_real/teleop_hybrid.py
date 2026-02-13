@@ -1150,6 +1150,7 @@ class HybridLocoTeleop:
             "actual_state": self.state,  # For debugging
             "is_interpolating": self.is_interpolating,
             "interp_to_state": self.interp_to_state if self.is_interpolating else None,
+            "hands_paused": self.hands_paused,  # A+X upper body freeze state
         }
         self.redis_pipeline.set("teleop_state_info", json.dumps(state_info))
         

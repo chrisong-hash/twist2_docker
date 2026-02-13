@@ -498,11 +498,13 @@ class RealTimePolicyController(object):
                     teleop_state = "teleop_full"  # Default
                     locomotion_active = False
                     
+                    hands_paused = False  # Default: arms track normally
                     if teleop_state_str:
                         try:
                             state_info = json.loads(teleop_state_str)
                             locomotion_active = state_info.get("locomotion_active", False)
                             teleop_state = state_info.get("state", "teleop_full")
+                            hands_paused = state_info.get("hands_paused", False)  # A+X freeze state
                         except Exception as e:
                             print(f"[HYBRID] Error parsing state: {e}")
                     
@@ -530,9 +532,18 @@ class RealTimePolicyController(object):
                     if use_locomode and not was_in_locomode:
                         # Switching TO LocoMode - reset policy buffers
                         self.loco_policy.reset()
-                        # Freeze arm position when entering locomotion mode
-                        self._frozen_arm_pos = target_dof_pos[15:29].copy()
                     self._was_in_locomode = use_locomode
+                    
+                    # Capture arm position when A+X is first pressed (hands_paused becomes True)
+                    was_hands_paused = getattr(self, '_was_hands_paused', False)
+                    if hands_paused and not was_hands_paused:
+                        # User just pressed A+X - capture current arm position
+                        self._frozen_arm_pos = target_dof_pos[15:29].copy()
+                        print("[HYBRID] Arms frozen at current position (A+X pressed)")
+                    elif not hands_paused and was_hands_paused:
+                        # User released A+X - arms should track again
+                        print("[HYBRID] Arms tracking resumed (A+X released)")
+                    self._was_hands_paused = hands_paused
                     
                     # Debug: print state changes
                     if not hasattr(self, '_last_teleop_state') or self._last_teleop_state != teleop_state or \
@@ -568,11 +579,12 @@ class RealTimePolicyController(object):
                                 dof_pos, dof_vel, ang_vel, quat, vel_cmd, torso_rpy=torso_rpy
                             )
                             
-                            # GearWBC target: legs + waist from policy, arms FROZEN
+                            # GearWBC target: legs + waist from policy
                             target_dof_pos[:15] = loco_action[:15]  # Legs + waist from GearWBC
-                            # Arms stay at frozen position
-                            if hasattr(self, '_frozen_arm_pos'):
+                            # Arms: freeze if A+X pressed, otherwise track from GMR
+                            if hands_paused and hasattr(self, '_frozen_arm_pos'):
                                 target_dof_pos[15:29] = self._frozen_arm_pos
+                            # else: arms keep tracking from target_dof_pos (GMR/mimic_obs)
                         else:
                             # LocoMode fallback: takes gravity_ori, outputs 12 DOF (legs only)
                             gravity_ori = get_gravity_orientation_from_quat(quat)
@@ -583,8 +595,10 @@ class RealTimePolicyController(object):
                             # LocoMode target: legs from policy, waist at default
                             target_dof_pos[:12] = loco_action[:12]
                             target_dof_pos[12:15] = self.loco_policy.default_angles_reorder[12:15]
-                            if hasattr(self, '_frozen_arm_pos'):
+                            # Arms: freeze if A+X pressed, otherwise track from GMR
+                            if hands_paused and hasattr(self, '_frozen_arm_pos'):
                                 target_dof_pos[15:29] = self._frozen_arm_pos
+                            # else: arms keep tracking from target_dof_pos (GMR/mimic_obs)
                         
                         # Build PD gains (locomotion gains for lower body, config for upper)
                         final_kps = np.zeros(29, dtype=np.float32)
