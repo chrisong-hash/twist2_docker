@@ -408,6 +408,12 @@ class HybridLocoTeleop:
         self.frozen_arm_obs = None  # Stored arm positions when freezing
         self._capture_frozen_arms = False  # Flag to capture arm positions on next frame
         
+        # Backward stop recovery: inject forward impulse when stopping from backward walk
+        self._was_walking_backward = False
+        self._backward_stop_time = None
+        self._backward_recovery_duration = 0.5  # seconds of forward nudge
+        self._backward_recovery_speed = 0.10    # forward vel during recovery
+        
         # Inspire hand state
         self.use_inspire_hands = getattr(args, 'use_inspire_hands', False)
         self.inspire_hand_controller = None
@@ -436,21 +442,6 @@ class HybridLocoTeleop:
         self.smooth_window_size = args.smooth_window_size
         self.smooth_history = []  # Store recent observations for sliding window
         
-        # Velocity scaling (to match GROOT's intended walking speed range)
-        # GROOT original Joycon uses MAX_LINEAR_VEL=0.2, which after cmd_scale [2.0, 2.0, 0.5]
-        # gives reasonable speeds. Without scaling, joystick at 1.0 would be way too fast.
-        self.vel_scale_forward = args.vel_scale_forward     # Max forward vel
-        self.vel_scale_backward = args.vel_scale_backward   # Max backward vel (more conservative)
-        self.vel_scale_strafe = args.vel_scale_strafe       # Max strafe vel
-        self.vel_scale_yaw = args.vel_scale_yaw             # Max yaw vel
-        
-        # Backward stop recovery: if robot was walking backward and stops,
-        # inject a brief forward impulse to help it regain balance
-        self._was_walking_backward = False
-        self._backward_stop_time = None
-        self._backward_recovery_duration = 0.5  # seconds of forward nudge
-        self._backward_recovery_speed = 0.10    # forward vel during recovery
-        
         # Calibration offset system - when entering teleop, store user's pose as "zero reference"
         # Robot movements are relative to this calibration, not absolute
         self.calibration_mimic_obs = None  # User's pose when entering teleop
@@ -471,15 +462,6 @@ class HybridLocoTeleop:
             print(f"[cyan]Smooth filtering: ENABLED (window size: {self.smooth_window_size} frames)[/cyan]")
         else:
             print("[yellow]Smooth filtering: DISABLED[/yellow]")
-        
-        # Print velocity scaling info
-        print(f"\n[cyan]Velocity scaling (for GROOT GearWBC compatibility):[/cyan]")
-        print(f"  Forward:  {self.vel_scale_forward:.2f} → max {self.vel_scale_forward * 2.0:.1f} m/s")
-        print(f"  Backward: {self.vel_scale_backward:.2f} → max {self.vel_scale_backward * 2.0:.1f} m/s")
-        print(f"  Strafe:   {self.vel_scale_strafe:.2f} → max {self.vel_scale_strafe * 2.0:.1f} m/s")
-        print(f"  Yaw:      {self.vel_scale_yaw:.2f} → max {self.vel_scale_yaw * 0.5:.2f} rad/s")
-        print(f"  [yellow]Tune with --vel_scale_forward, --vel_scale_backward, etc.[/yellow]")
-        
         self._print_controls()
     
     def _setup_locomotion_policy(self):
@@ -935,21 +917,11 @@ class HybridLocoTeleop:
         left_axis = left_ctrl.get("axis", [0, 0])
         right_axis = right_ctrl.get("axis", [0, 0])
         
-        # Only active in teleop_loco (walk mode) - with velocity scaling for GROOT compatibility
+        # Only active in teleop_loco (walk mode)
         if self.state == "teleop_loco" or (self.is_interpolating and self.interp_to_state == "teleop_loco"):
-            # GROOT policy expects raw commands in ~0.2 range, not 0-1
-            raw_forward = left_axis[1] if len(left_axis) > 1 else 0.0
-            raw_strafe = -left_axis[0] if len(left_axis) > 0 else 0.0
-            raw_yaw = -right_axis[0] if len(right_axis) > 0 else 0.0
-            
-            # Apply asymmetric scaling for forward vs backward (backward is less stable)
-            if raw_forward >= 0:
-                self.vel_cmd[0] = raw_forward * self.vel_scale_forward
-            else:
-                self.vel_cmd[0] = raw_forward * self.vel_scale_backward
-            
-            self.vel_cmd[1] = raw_strafe * self.vel_scale_strafe
-            self.vel_cmd[2] = raw_yaw * self.vel_scale_yaw
+            self.vel_cmd[0] = left_axis[1] if len(left_axis) > 1 else 0.0
+            self.vel_cmd[1] = -left_axis[0] if len(left_axis) > 0 else 0.0
+            self.vel_cmd[2] = -right_axis[0] if len(right_axis) > 0 else 0.0
             
             # Backward stop recovery: detect when backward walking stops
             is_walking_backward = self.vel_cmd[0] < -0.02
@@ -1485,31 +1457,6 @@ def parse_args():
         type=int,
         default=500,
         help="Inspire hand force limit (0-3000, default 500).",
-    )
-    # Velocity scaling (matching GROOT original: MAX_LINEAR_VEL=0.2, MAX_ANGULAR_VEL=0.5)
-    parser.add_argument(
-        "--vel_scale_forward",
-        type=float,
-        default=0.35,
-        help="Forward velocity scale (joystick 1.0 → this m/s). Default: 0.35",
-    )
-    parser.add_argument(
-        "--vel_scale_backward",
-        type=float,
-        default=0.15,
-        help="Backward velocity scale (lower for stability). GROOT original: 0.2",
-    )
-    parser.add_argument(
-        "--vel_scale_strafe",
-        type=float,
-        default=0.2,
-        help="Strafe velocity scale. GROOT original: 0.2",
-    )
-    parser.add_argument(
-        "--vel_scale_yaw",
-        type=float,
-        default=0.4,
-        help="Yaw velocity scale. GROOT original: 0.5",
     )
     return parser.parse_args()
 
