@@ -457,6 +457,9 @@ class HybridLocoTeleop:
         self._backward_recovery_duration = 0.5  # seconds of forward nudge
         self._backward_recovery_speed = 0.10    # forward vel during recovery
         
+        # Anti-drift compensation for pure rotation
+        self.rotation_drift_compensation = args.rotation_drift_compensation
+        
         # Calibration offset system - when entering teleop, store user's pose as "zero reference"
         # Robot movements are relative to this calibration, not absolute
         self.calibration_mimic_obs = None  # User's pose when entering teleop
@@ -956,6 +959,20 @@ class HybridLocoTeleop:
             
             self.vel_cmd[1] = raw_strafe * self.vel_scale_strafe
             self.vel_cmd[2] = raw_yaw * self.vel_scale_yaw
+            
+            # Anti-drift compensation: For pure rotation (only yaw commanded),
+            # explicitly zero out x/y velocities to reduce drift
+            if self.rotation_drift_compensation:
+                yaw_threshold = 0.05  # Significant yaw command
+                xy_threshold = 0.02   # Negligible x/y command
+                is_pure_rotation = (abs(self.vel_cmd[2]) > yaw_threshold and 
+                                   abs(self.vel_cmd[0]) < xy_threshold and 
+                                   abs(self.vel_cmd[1]) < xy_threshold)
+                
+                if is_pure_rotation:
+                    # Pure rotation mode - force x/y to zero to minimize drift
+                    self.vel_cmd[0] = 0.0
+                    self.vel_cmd[1] = 0.0
             
             # Backward stop recovery: detect when backward walking stops
             is_walking_backward = self.vel_cmd[0] < -0.02
@@ -1497,8 +1514,8 @@ def parse_args():
     parser.add_argument(
         "--vel_scale_forward",
         type=float,
-        default=0.15,
-        help="Forward velocity scale (joystick 1.0 → 0.3 m/s after cmd_scale). Default: 0.15",
+        default=0.175,
+        help="Forward velocity scale (joystick 1.0 → 0.3 m/s after cmd_scale). Default: 0.175",
     )
     parser.add_argument(
         "--vel_scale_backward",
@@ -1509,8 +1526,8 @@ def parse_args():
     parser.add_argument(
         "--vel_scale_strafe",
         type=float,
-        default=0.2,
-        help="Strafe velocity scale. GROOT original: 0.2",
+        default=0.15,
+        help="Strafe velocity scale. GROOT original: 0.15",
     )
     parser.add_argument(
         "--vel_scale_yaw",
@@ -1518,6 +1535,19 @@ def parse_args():
         default=0.4,
         help="Yaw velocity scale. GROOT original: 0.5",
     )
+    # Anti-drift compensation for pure rotation
+    parser.add_argument(
+        "--rotation_drift_compensation",
+        action="store_true",
+        help="Enable drift compensation during pure rotation (zeros x/y vel when only rotating). Default: enabled",
+    )
+    parser.add_argument(
+        "--no_rotation_drift_compensation",
+        dest="rotation_drift_compensation",
+        action="store_false",
+        help="Disable drift compensation during pure rotation",
+    )
+    parser.set_defaults(rotation_drift_compensation=True)
     return parser.parse_args()
 
 
